@@ -1,0 +1,102 @@
+"""Experiment configuration for piano AMT training."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+
+
+@dataclass
+class Config:
+    # Dataset
+    maestro_version: str = "v3.0.0"
+    midi_min: int = 21                  # A0
+    midi_max: int = 108                 # C8
+    sample_rate: int = 16000
+    segment_seconds: float = 12.0       # Long enough for note context, still batchable on A100
+    hop_length: int = 160               # 10 ms at 16 kHz -> 100 fps
+    n_fft: int = 2048
+    n_mels: int = 229
+    f_min: float = 27.5                 # A0
+    f_max: float = 8000.0
+    feature_type: str = "mel"           # Existing pre-sliced cache is mel.
+    cqt_bins_per_octave: int = 48
+    cqt_n_bins: int = 48 * 8            # Kept for old/fallback experiments only.
+
+    # Model
+    resnet_name: str = "resnet34"
+    pretrained: bool = True
+    decoder_channels: int = 256
+    dropout: float = 0.10
+
+    # Training
+    FIND_OPTIMAL_SETTINGS: bool = False
+    batch_size: int = 32
+    num_workers: int = 2
+    epochs: int = 40
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    use_amp: bool = True
+
+    # Loss weights
+    onset_loss_weight: float = 2.0
+    offset_loss_weight: float = 1.0
+    frame_loss_weight: float = 1.0
+    velocity_loss_weight: float = 0.5
+    sustain_loss_weight: float = 0.5
+    onset_pos_weight: float = 16.0
+    offset_pos_weight: float = 12.0
+    frame_pos_weight: float = 3.0
+    sustain_pos_weight: float = 2.0
+
+    # Label construction
+    onset_width_frames: int = 2
+    offset_width_frames: int = 2
+    sustain_threshold: int = 64
+
+    # Augmentation
+    enable_audio_augment: bool = False
+    enable_spec_augment: bool = True
+    noise_probability: float = 0.35
+    reverb_probability: float = 0.20
+    gain_probability: float = 0.90
+    eq_probability: float = 0.30
+    spec_mask_probability: float = 0.50
+
+    # Decoding
+    onset_threshold: float = 0.50
+    frame_threshold: float = 0.35
+    offset_threshold: float = 0.35
+    min_note_seconds: float = 0.03
+    merge_onset_seconds: float = 0.03
+
+    @property
+    def n_pitches(self) -> int:
+        return self.midi_max - self.midi_min + 1
+
+    @property
+    def fps(self) -> float:
+        return self.sample_rate / self.hop_length
+
+    @property
+    def segment_samples(self) -> int:
+        return int(round(self.segment_seconds * self.sample_rate))
+
+    @property
+    def label_frames(self) -> int:
+        # Matches torch STFT center=True behavior reasonably well: 1 + n_samples // hop.
+        return 1 + self.segment_samples // self.hop_length
+
+
+def config_to_json(cfg: Config) -> str:
+    return json.dumps(asdict(cfg), indent=2)
+
+
+def default_run_name(cfg: Config) -> str:
+    return (
+        f"{cfg.resnet_name}_maestro_{cfg.maestro_version}_{cfg.feature_type}"
+        f"_sr{cfg.sample_rate}_hop{cfg.hop_length}_seg{int(cfg.segment_seconds)}"
+    )
+
+
+CFG = Config()
