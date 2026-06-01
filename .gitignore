@@ -219,3 +219,6 @@ __marimo__/
 
 # dont need this
 pyrightconfig.json
+
+# ignore the quarto files
+*.qmd 

@@ -1,0 +1,242 @@
+---
+title: Automatic Piano Transcription Experiment
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .qmd
+      format_name: quarto
+      format_version: '1.0'
+      jupytext_version: 1.19.3
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+
+This notebook is intentionally short. The implementation lives in editable Python modules under `src/piano_modeling/`, while realtime/deployment code lives under `src/piano_live_inference/`.
+
+
+# Setup
+
+```{python}
+#@title 1. Clone/update repo and install dependencies
+import os
+
+REPO_URL = "https://github.com/JDub323/piano_amt.git"  # change if this repo URL changes
+REPO_DIR = "/content/piano_amt"
+
+if not os.path.exists(REPO_DIR):
+    !git clone {REPO_URL} {REPO_DIR}
+else:
+    %cd {REPO_DIR}
+    !git pull
+
+%cd {REPO_DIR}
+%pip -q install -r requirements.txt
+%pip -q install -e .
+```
+
+```{python}
+#@title 2. Autoreload project modules
+%reload_ext autoreload
+%autoreload 2
+```
+
+Remember: autoreload reloads module definitions, not objects. Recreate the `system`, loaders, optimizer, or config after changing their definitions.
+
+```{python}
+#@title 3. Imports and runtime setup
+# from dataclasses import asdict
+# import gc
+# import json
+# from pathlib import Path
+
+# import pandas as pd
+# import torch
+
+from piano_modeling import Config, config_to_json, setup_runtime, make_colab_paths, print_paths
+from piano_modeling.maestro_cache import load_cached_maestro_manifest, preprocess_maestro_in_download_batches
+from piano_modeling.sliced_cache import load_or_build_sliced_dataset
+from piano_modeling.models import PianoTranscriptionSystem, count_parameters_millions
+from piano_modeling.training import run_training, load_checkpoint
+from piano_modeling.benchmark import describe_runtime, sweep_training_settings, apply_best_benchmark_config
+from piano_modeling.diagnostics import check_dataset_artifacts
+from piano_modeling.export import export_prediction_bundle
+
+DEVICE = setup_runtime(seed=1337)
+describe_runtime(DEVICE)
+```
+
+```{python}
+#@title 4. Config
+cfg = Config()
+
+# Optional per-run overrides can still live here:
+# cfg.resnet_name = "resnet34"
+# cfg.batch_size = 32
+# cfg.num_workers = 2
+# cfg.lr = 2e-4
+# cfg.epochs = 40
+
+print(config_to_json(cfg))
+```
+
+```{python}
+#@title 5. Mount Drive, create paths, and define cache-safety flags
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+paths = make_colab_paths('/content/drive/MyDrive/piano_transcription_resnet')
+print_paths(paths)
+
+# Safe defaults: use the existing pre-sliced dataset and do not redo expensive work.
+USE_PRE_SLICED_DATASET = True
+ALLOW_REBUILD_IF_SLICED_ZIP_MISSING = False
+FORCE_RESPLICE_SLICED_CACHE = False
+
+# Full-song MAESTRO preprocessing is fallback-only. Keep False unless intentionally rebuilding.
+RUN_MAESTRO_PREPROCESS = False
+NUM_MAESTRO_DOWNLOAD_BATCHES = 3
+START_BATCH_INDEX = 0
+END_BATCH_INDEX = -1
+OVERWRITE_EXISTING_SPECS = False
+```
+
+```{python}
+#@title 6. Load metadata/full-song manifest without long downloads
+# This downloads tiny MAESTRO metadata only if missing. It does not download the full audio dataset.
+meta = load_cached_maestro_manifest(paths, cfg, download_if_missing=True)
+
+if RUN_MAESTRO_PREPROCESS:
+    meta = preprocess_maestro_in_download_batches(
+        paths,
+        cfg,
+        num_batches=NUM_MAESTRO_DOWNLOAD_BATCHES,
+        start_batch=START_BATCH_INDEX,
+        end_batch=None if END_BATCH_INDEX < 0 else END_BATCH_INDEX,
+        overwrite_existing_specs=OVERWRITE_EXISTING_SPECS,
+        device=DEVICE,
+    )
+else:
+    print('Full-song spectrogram preprocessing is disabled. The training path will restore/use the pre-sliced zip instead.')
+```
+
+```{python}
+#@title 7. Restore/load pre-sliced MAESTRO dataset
+# Normal path: if /content/local_maestro_sliced exists, reuse it.
+# Otherwise restore paths.sliced_zip_path from Drive.
+# It only rebuilds/reslices if you explicitly enable the flags above.
+sliced_meta = load_or_build_sliced_dataset(
+    paths,
+    cfg,
+    meta_df=meta,
+    use_pre_sliced_dataset=USE_PRE_SLICED_DATASET,
+    allow_rebuild_if_sliced_zip_missing=ALLOW_REBUILD_IF_SLICED_ZIP_MISSING,
+    force_resplice_sliced_cache=FORCE_RESPLICE_SLICED_CACHE,
+)
+```
+
+```{python}
+#@title 8. Build model
+system = PianoTranscriptionSystem(cfg).to(DEVICE)
+print('Parameters:', count_parameters_millions(system), 'M')
+```
+
+```{python}
+#@title 9. Optional benchmark batch size/workers
+RUN_BENCHMARK = False  #@param {type:'boolean'}
+
+if RUN_BENCHMARK:
+    bench_df = sweep_training_settings(
+        sliced_meta,
+        base_cfg=cfg,
+        batch_sizes=(16, 24, 32),
+        num_workers_list=(2, 4, 8),
+        amp_options=(True,),
+        device=DEVICE,
+    )
+    display(bench_df)
+    cfg = apply_best_benchmark_config(cfg, bench_df, memory_soft_limit_gb=14.0)
+else:
+    print('Skipping benchmark.')
+```
+
+```{python}
+#@title 10. Start or resume training
+RUN_TRAINING = True    #@param {type:'boolean'}
+CUSTOM_RUN_SUFFIX = "" #@param {type:'string'}
+TRAIN_SAMPLES_PER_EPOCH = 20000 #@param {type:'integer'}
+VAL_SAMPLES = 0 #@param {type:'integer'}
+RESUME = True #@param {type:'boolean'}
+
+if RUN_TRAINING:
+    train_result = run_training(
+        system=system,
+        cfg=cfg,
+        paths=paths,
+        sliced_meta=sliced_meta,
+        custom_run_suffix=CUSTOM_RUN_SUFFIX,
+        train_samples_per_epoch=TRAIN_SAMPLES_PER_EPOCH,
+        val_samples=VAL_SAMPLES,
+        resume=RESUME,
+        device=DEVICE,
+    )
+    RUN_NAME = train_result['run_name']
+    best_ckpt = train_result['best_ckpt']
+    last_ckpt = train_result['last_ckpt']
+else:
+    train_result = None
+    RUN_NAME = None
+    best_ckpt = None
+    last_ckpt = None
+    print('Skipping training.')
+```
+
+# Inference/export examples
+
+```{python}
+#@title 11. Export a prediction bundle for an audio file
+RUN_EXPORT_EXAMPLE = True #@param {type:'boolean'}
+AUDIO_PATH = "/path/to/piano.wav" #@param {type:'string'}
+OUT_STEM = "my_transcription" #@param {type:'string'}
+CHECKPOINT_TO_LOAD = "best" #@param ["best", "last", "custom"]
+CUSTOM_CHECKPOINT_PATH = "" #@param {type:'string'}
+
+if RUN_EXPORT_EXAMPLE:
+    if CHECKPOINT_TO_LOAD == 'custom':
+        ckpt_path = Path(CUSTOM_CHECKPOINT_PATH)
+    elif CHECKPOINT_TO_LOAD == 'last':
+        ckpt_path = last_ckpt
+    else:
+        ckpt_path = best_ckpt
+    load_checkpoint(ckpt_path, system, map_location=DEVICE, cfg=cfg)
+    result = export_prediction_bundle(AUDIO_PATH, system, OUT_STEM, paths.export_dir, cfg)
+    result
+else:
+    print('Skipping export example.')
+```
+
+# Diagnostics / optional live inference
+
+```{python}
+#@title 12. Check expected Drive/local artifacts
+RUN_ARTIFACT_CHECK = False #@param {type:'boolean'}
+if RUN_ARTIFACT_CHECK:
+    check_dataset_artifacts(paths)
+else:
+    print('Skipping artifact check.')
+```
+
+```{python}
+#@title 13. Optional realtime imports
+# The realtime code is separated so you can ignore it until the model is good.
+# from piano_live_inference import RealTimePianoTranscriber, benchmark_latency
+# from piano_live_inference.gradio_app import launch_gradio_realtime
+# from piano_live_inference.deploy import export_torchscript
+#
+# load_checkpoint(best_ckpt, system, map_location=DEVICE, cfg=cfg)
+# benchmark_latency(system, cfg, seconds=2.0, repeats=20, device=DEVICE)
+# launch_gradio_realtime(system, cfg)
+```
