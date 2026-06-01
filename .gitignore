@@ -217,7 +217,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-
-# don't update ipynb incase I lose secret keys or something
-*.ipynb
+# dont need this
 pyrightconfig.json
