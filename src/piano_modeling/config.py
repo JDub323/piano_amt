@@ -27,6 +27,7 @@ class Config:
     pretrained: bool = True
     decoder_channels: int = 256
     dropout: float = 0.10
+    compile_model: bool = True
 
     # Training
     FIND_OPTIMAL_SETTINGS: bool = False

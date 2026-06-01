@@ -141,6 +141,10 @@ sliced_meta = load_or_build_sliced_dataset(
 ```{python}
 #@title 8. Build model
 system = PianoTranscriptionSystem(cfg).to(DEVICE)
+
+if cfg.compile_model:
+    system = torch.compile(model)
+
 print('Parameters:', count_parameters_millions(system), 'M')
 ```
 

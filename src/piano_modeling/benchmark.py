@@ -60,7 +60,6 @@ def benchmark_training_setting(
     use_amp: bool = True,
     grad_accum_steps: int = 1,
     lr: float | None = None,
-    compile_model: bool = True,
     train_samples: int = 1024,
     warmup_steps: int = 2,
     timed_optimizer_steps: int = 8,
@@ -81,7 +80,7 @@ def benchmark_training_setting(
         "grad_accum_steps": grad_accum_steps,
         "effective_batch_size": batch_size * grad_accum_steps,
         "lr": lr,
-        "compile_model": compile_model,
+        "compile_model": cfg.compile_model,
         "status": "not_run",
         "chunks_per_sec": 0.0,
         "optimizer_steps_per_sec": 0.0,
@@ -91,7 +90,7 @@ def benchmark_training_setting(
     try:
         train_loader, train_ds = _safe_make_train_loader(sliced_meta, cfg, train_samples=max(train_samples, batch_size * grad_accum_steps * 4), device=device)
         bench_model = PianoTranscriptionSystem(cfg).to(device)
-        if compile_model:
+        if cfg.compile_model:
             if hasattr(torch, "compile"):
                 bench_model = torch.compile(bench_model)
             else:
@@ -178,7 +177,6 @@ def sweep_training_settings(
             num_workers=num_workers,
             use_amp=use_amp,
             grad_accum_steps=1,
-            compile_model=True,
             train_samples=1024,
             warmup_steps=2,
             timed_optimizer_steps=8,
