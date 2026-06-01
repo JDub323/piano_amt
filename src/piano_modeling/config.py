@@ -23,7 +23,7 @@ class Config:
     cqt_n_bins: int = 48 * 8            # Kept for old/fallback experiments only.
 
     # Model
-    resnet_name: str = "resnet34"
+    resnet_name: str = "resnet34.a1_in1k"
     pretrained: bool = True
     decoder_channels: int = 256
     dropout: float = 0.10
