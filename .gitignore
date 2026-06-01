@@ -220,3 +220,4 @@ __marimo__/
 
 # don't update ipynb incase I lose secret keys or something
 *.ipynb
+pyrightconfig.json
