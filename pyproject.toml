@@ -48,9 +48,12 @@ dev = [
 colab = [
   "gdown",
 ]
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["piano_modeling*"]
 
 [tool.black]
 line-length = 100
