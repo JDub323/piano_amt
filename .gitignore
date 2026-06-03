@@ -222,3 +222,5 @@ pyrightconfig.json
 
 # ignore the quarto files
 *.qmd 
+
+notes/
