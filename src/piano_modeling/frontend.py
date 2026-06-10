@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torchaudio
-
 from .audio import SpecAugment
 from .config import Config
 
@@ -15,6 +13,13 @@ class SpectrogramFrontend(nn.Module):
         self.cfg = cfg
         self.specaugment = SpecAugment(cfg)
         if cfg.feature_type.lower() == "mel":
+            try:
+                import torchaudio
+            except (ImportError, OSError) as exc:
+                raise ImportError(
+                    "Mel spectrogram frontend requires a working torchaudio install. "
+                    "Install the torch/torchaudio build that matches your platform."
+                ) from exc
             self.transform = torchaudio.transforms.MelSpectrogram(
                 sample_rate=cfg.sample_rate,
                 n_fft=cfg.n_fft,

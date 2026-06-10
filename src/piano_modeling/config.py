@@ -26,6 +26,7 @@ class Config:
     resnet_name: str = "resnet34.a1_in1k"
     pretrained: bool = True
     decoder_channels: int = 256
+    decoder_type: str = "fpn"             # "fpn" uses encoder skip features; "legacy" uses deepest map only.
     dropout: float = 0.10
     compile_model: bool = True
 

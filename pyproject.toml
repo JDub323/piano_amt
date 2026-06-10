@@ -34,7 +34,12 @@ dependencies = [
   "librosa",
   "scikit-learn",
   "matplotlib",
+  "timm",
+  "mir_eval",
 ]
+
+[project.scripts]
+piano-evaluate = "piano_modeling.evaluation:main"
 
 [project.optional-dependencies]
 dev = [
@@ -43,17 +48,32 @@ dev = [
   "black",
   "ipykernel",
   "jupyter",
+  "tensorboard",
+]
+
+train = [
+  "remotezip",
+  "nnAudio",
+  "tensorboard",
+]
+
+live = [
+  "gradio",
+  "sounddevice",
 ]
 
 colab = [
   "gdown",
+  "remotezip",
+  "nnAudio",
+  "tensorboard",
 ]
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["piano_modeling*"]
+include = ["piano_modeling*", "piano_live_inference*"]
 
 [tool.black]
 line-length = 100

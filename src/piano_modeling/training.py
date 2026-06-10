@@ -1,4 +1,4 @@
-"""Training, validation, checkpointing, and run orchestration."""
+"""Training, validation, checkpointing, TensorBoard logging, and run orchestration."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -10,10 +10,17 @@ import torch
 from tqdm.auto import tqdm
 
 from .common import DEVICE
-from .config import Config, default_run_name
+from .config import Config, config_to_json, default_run_name
 from .datasets import make_sliced_loaders
 from .losses import compute_loss, move_batch_to_device
 from .paths import ProjectPaths
+from .tensorboard_debug import (
+    create_summary_writer,
+    log_epoch_metrics,
+    log_model_debug_batch,
+    log_scalar_dict,
+    try_add_model_graph,
+)
 
 
 def save_checkpoint(path: Path, system, optimizer, epoch: int, cfg: Config, best_metric: float, extra: Optional[dict] = None) -> None:
@@ -37,7 +44,7 @@ def assert_checkpoint_config_compatible(ckpt: dict, cfg: Config) -> None:
     keys = [
         "feature_type", "sample_rate", "hop_length", "n_fft", "n_mels",
         "f_min", "f_max", "segment_seconds", "midi_min", "midi_max",
-        "resnet_name", "decoder_channels",
+        "resnet_name", "decoder_channels", "decoder_type",
     ]
     mismatches = []
     current = asdict(cfg)
@@ -67,23 +74,46 @@ def model_input_from_batch(batch: Dict[str, Any]) -> torch.Tensor:
     return batch["spec"] if "spec" in batch else batch["audio"]
 
 
-def train_one_epoch(system, loader, optimizer, scaler, cfg: Config, epoch: int, device: str = DEVICE):
+def train_one_epoch(
+    system,
+    loader,
+    optimizer,
+    scaler,
+    cfg: Config,
+    epoch: int,
+    device: str = DEVICE,
+    *,
+    writer=None,
+    tensorboard_log_every: int = 100,
+    tensorboard_log_graph: bool = False,
+):
     system.train()
     loss_sums, n_examples = {}, 0
     ema = {}
+    graph_logged = False
     pbar = tqdm(loader, desc=f"train epoch {epoch}", leave=False)
     for i, batch in enumerate(pbar):
         batch = move_batch_to_device(batch, device)
         model_input = model_input_from_batch(batch)
+        global_step = max(0, epoch - 1) * max(1, len(loader)) + i
         if i == 0 and device == "cuda":
             mem_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
             mem_res = torch.cuda.memory_reserved() / (1024 ** 3)
             print(f"\n[GPU Memory - Batch 0] Allocated: {mem_alloc:.2f} GB, Reserved: {mem_res:.2f} GB")
+            log_scalar_dict(
+                writer,
+                "debug_cuda_memory_gb",
+                {"allocated": mem_alloc, "reserved": mem_res},
+                global_step,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(cfg.use_amp and device == "cuda")):
             pred = system(model_input, target_frames=batch["frame"].shape[1])
             loss, loss_dict = compute_loss(pred, batch, cfg)
+
+        if writer is not None and tensorboard_log_graph and not graph_logged:
+            graph_logged = try_add_model_graph(writer, system, model_input, int(batch["frame"].shape[1]))
 
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -97,6 +127,9 @@ def train_one_epoch(system, loader, optimizer, scaler, cfg: Config, epoch: int, 
             if cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(system.parameters(), cfg.grad_clip)
             optimizer.step()
+
+        if writer is not None and tensorboard_log_every > 0 and i % tensorboard_log_every == 0:
+            log_model_debug_batch(writer, system, model_input, batch, pred, loss_dict, cfg, global_step)
 
         bs = int(model_input.shape[0])
         n_examples += bs
@@ -126,7 +159,7 @@ def f1_from_counts(tp: float, fp: float, fn: float):
 
 @torch.no_grad()
 def validate_quick(system, loader, cfg: Config, device: str = DEVICE):
-    """Validation with epoch-averaged losses and globally accumulated F1 counts."""
+    """Validation with epoch-averaged losses and globally accumulated dense-label F1 counts."""
     system.eval()
     loss_sums, n_examples = {}, 0
     counts = {
@@ -174,8 +207,21 @@ def run_training(
     val_samples: int = 0,
     resume: bool = True,
     device: str = DEVICE,
+    *,
+    enable_tensorboard: bool = True,
+    tensorboard_log_dir: Optional[str | Path] = None,
+    tensorboard_log_every: int = 100,
+    tensorboard_log_graph: bool = True,
+    formal_eval_meta: Optional[pd.DataFrame] = None,
+    formal_eval_split: str = "validation",
+    formal_eval_n_tracks: int = 0,
 ):
-    """Create loaders/optimizer/checkpoints and run the training loop."""
+    """Create loaders/optimizer/checkpoints and run the training loop.
+
+    ``validate_quick`` remains the cheap per-epoch dense-label check. When ``formal_eval_meta`` and
+    ``formal_eval_n_tracks`` are provided, the run also performs note-level evaluation with the same
+    machinery used by the ``piano-evaluate`` CLI whenever a new best checkpoint is found.
+    """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -198,6 +244,12 @@ def run_training(
     best_ckpt = run_dir / "best.pt"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    writer_dir = Path(tensorboard_log_dir) if tensorboard_log_dir is not None else run_dir / "tensorboard"
+    writer = create_summary_writer(writer_dir, enabled=enable_tensorboard)
+    if writer is not None:
+        writer.add_text("config/json", f"```json\n{config_to_json(cfg)}\n```", 0)
+        writer.add_text("run/name", run_name, 0)
+
     start_epoch = 1
     best_metric = -1.0
     history = []
@@ -212,24 +264,65 @@ def run_training(
 
     print("Run directory:", run_dir)
     print("RUN_NAME:", run_name)
+    if writer is not None:
+        print("TensorBoard log directory:", writer_dir)
 
-    for epoch in range(start_epoch, cfg.epochs + 1):
-        train_stats = train_one_epoch(system, train_loader, optimizer, scaler, cfg, epoch, device=device)
-        val_stats = validate_quick(system, val_loader, cfg, device=device)
-        metric = val_stats.get("onset_f1", 0.0) + val_stats.get("frame_f1", 0.0) + val_stats.get("offset_f1", 0.0)
-        row = {
-            "epoch": epoch,
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            **{f"val_{k}": v for k, v in val_stats.items()},
-        }
-        history.append(row)
-        pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
-        save_checkpoint(last_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
-        if metric > best_metric:
-            best_metric = metric
-            save_checkpoint(best_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
-            print(f"Epoch {epoch}: new best metric={best_metric:.4f}; saved {best_ckpt}")
-        print(row)
+    try:
+        for epoch in range(start_epoch, cfg.epochs + 1):
+            train_stats = train_one_epoch(
+                system,
+                train_loader,
+                optimizer,
+                scaler,
+                cfg,
+                epoch,
+                device=device,
+                writer=writer,
+                tensorboard_log_every=tensorboard_log_every,
+                tensorboard_log_graph=(tensorboard_log_graph and epoch == start_epoch),
+            )
+            val_stats = validate_quick(system, val_loader, cfg, device=device)
+            metric = val_stats.get("onset_f1", 0.0) + val_stats.get("frame_f1", 0.0) + val_stats.get("offset_f1", 0.0)
+            is_best = metric > best_metric
+            if is_best:
+                best_metric = metric
+
+            row = {
+                "epoch": epoch,
+                **{f"train_{k}": v for k, v in train_stats.items()},
+                **{f"val_{k}": v for k, v in val_stats.items()},
+                "selection_metric": metric,
+                "best_metric": best_metric,
+            }
+            history.append(row)
+            pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
+            save_checkpoint(last_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
+            if is_best:
+                save_checkpoint(best_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
+                print(f"Epoch {epoch}: new best metric={best_metric:.4f}; saved {best_ckpt}")
+                if formal_eval_meta is not None and formal_eval_n_tracks and formal_eval_n_tracks > 0:
+                    from .evaluation import evaluate_split_sample, summarize_evaluation_report
+
+                    report = evaluate_split_sample(
+                        formal_eval_meta,
+                        system,
+                        paths.export_dir,
+                        run_name,
+                        split=formal_eval_split,
+                        n_tracks=formal_eval_n_tracks,
+                        checkpoint_path=None,
+                        cfg=cfg,
+                        device=device,
+                    )
+                    formal_summary = summarize_evaluation_report(report)
+                    row.update({f"formal_eval_{k}": v for k, v in formal_summary.items()})
+                    log_scalar_dict(writer, "epoch/formal_eval", formal_summary, epoch)
+            log_epoch_metrics(writer, train_stats, val_stats, epoch)
+            print(row)
+    finally:
+        if writer is not None:
+            writer.flush()
+            writer.close()
 
     return {
         "run_name": run_name,
@@ -241,4 +334,5 @@ def run_training(
         "val_loader": val_loader,
         "train_ds": train_ds,
         "val_ds": val_ds,
+        "tensorboard_dir": writer_dir if enable_tensorboard else None,
     }

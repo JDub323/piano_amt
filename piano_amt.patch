@@ -1,0 +1,1419 @@
+diff -ruN piano_amt-main.orig/README.md piano_amt-main/README.md
+--- piano_amt-main.orig/README.md	2026-06-10 20:33:22.283313480 +0000
++++ piano_amt-main/README.md	2026-06-10 20:38:47.274423384 +0000
+@@ -1,2 +1,100 @@
+ # piano_amt
++
+ Retry of my automatic music transcription project, but I will fully utilize AI to speed up banal functions, so I can focus on the cool stuff. This is set up for Colab since I fried my laptop when I tried to run last project locally.
++
++## What it does
++
++This repo trains and evaluates a piano automatic music transcription model. Audio is converted to spectrogram-like features, the model predicts dense piano-roll heads for onset, offset, frame, velocity, and sustain pedal, and decoding/export utilities turn those probabilities into note events or MIDI.
++
++## Install
++
++```bash
++pip install -e ".[train,dev]"
++```
++
++For live demos, also install:
++
++```bash
++pip install -e ".[live]"
++```
++
++## Smoke tests
++
++The test suite uses synthetic data and a fake tiny encoder where possible, so it can catch shape, decoding, training-loop, and TensorBoard logging regressions without downloading MAESTRO or a large checkpoint.
++
++```bash
++pytest -q
++```
++
++## Training diagnostics
++
++`run_training` now writes TensorBoard logs by default under:
++
++```text
++<checkpoint_dir>/<run_name>/tensorboard
++```
++
++Useful TensorBoard panels to watch first:
++
++- `epoch/train/*` and `epoch/validation/*`: loss components and quick dense-label F1.
++- `debug_probabilities/*`: whether heads are saturated near 0 or 1.
++- `debug_activation_rate/*` vs `debug_target_density/*`: whether sparse heads such as onset/offset are firing at a plausible rate.
++- `debug_pr_curve/*`: precision/recall behavior by head.
++- `debug_global_norm/*`, `debug_param_norm/*`, and `debug_grad_norm/*`: dead/exploding parameter or gradient signals.
++- `debug_predictions/*` and `debug_targets/*`: visual piano-roll sanity checks.
++
++You can change the cadence or turn logging off:
++
++```python
++run_training(
++    system,
++    cfg,
++    paths,
++    sliced_meta,
++    enable_tensorboard=True,
++    tensorboard_log_every=100,
++    tensorboard_log_graph=True,
++)
++```
++
++## First-class evaluation
++
++Use the CLI to run formal note-level evaluation from a checkpoint and a metadata CSV with `audio_path`, `midi_path`, and `split` columns:
++
++```bash
++piano-evaluate \
++  --metadata-csv /path/to/metadata.csv \
++  --checkpoint /path/to/best.pt \
++  --output-dir /path/to/eval_reports \
++  --split test \
++  --n-tracks 20 \
++  --device cuda
++```
++
++This writes a per-track CSV and a JSON summary containing note onset F1, note onset+offset F1, velocity F1, pedal F1, and note counts.
++
++You can also opt into formal evaluation during training whenever a new best quick-validation checkpoint is found:
++
++```python
++run_training(
++    system,
++    cfg,
++    paths,
++    sliced_meta,
++    formal_eval_meta=maestro_meta,
++    formal_eval_split="validation",
++    formal_eval_n_tracks=5,
++)
++```
++
++Keep this small during training; full-track inference is much slower than the dense-label validation pass.
++
++## Model decoder
++
++The default model decoder is now `decoder_type="fpn"`, a feature-pyramid skip decoder that fuses all `timm` encoder stages before the output heads. This should preserve more time/frequency detail than the original deepest-feature-only decoder, which is especially important for precise onset timing.
++
++For old experiments or checkpoint comparisons, use:
++
++```python
++cfg.decoder_type = "legacy"
++```
+diff -ruN piano_amt-main.orig/pyproject.toml piano_amt-main/pyproject.toml
+--- piano_amt-main.orig/pyproject.toml	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/pyproject.toml	2026-06-10 20:36:51.056716439 +0000
+@@ -34,8 +34,13 @@
+   "librosa",
+   "scikit-learn",
+   "matplotlib",
++  "timm",
++  "mir_eval",
+ ]
+ 
++[project.scripts]
++piano-evaluate = "piano_modeling.evaluation:main"
++
+ [project.optional-dependencies]
+ dev = [
+   "pytest",
+@@ -43,17 +48,32 @@
+   "black",
+   "ipykernel",
+   "jupyter",
++  "tensorboard",
++]
++
++train = [
++  "remotezip",
++  "nnAudio",
++  "tensorboard",
++]
++
++live = [
++  "gradio",
++  "sounddevice",
+ ]
+ 
+ colab = [
+   "gdown",
++  "remotezip",
++  "nnAudio",
++  "tensorboard",
+ ]
+ [tool.setuptools]
+ package-dir = {"" = "src"}
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+-include = ["piano_modeling*"]
++include = ["piano_modeling*", "piano_live_inference*"]
+ 
+ [tool.black]
+ line-length = 100
+diff -ruN piano_amt-main.orig/requirements.txt piano_amt-main/requirements.txt
+--- piano_amt-main.orig/requirements.txt	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/requirements.txt	2026-06-10 20:38:47.267669440 +0000
+@@ -8,3 +8,5 @@
+ soundfile
+ soxr
+ scikit-learn
++tensorboard
++pytest
+diff -ruN piano_amt-main.orig/src/piano_modeling/__init__.py piano_amt-main/src/piano_modeling/__init__.py
+--- piano_amt-main.orig/src/piano_modeling/__init__.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/__init__.py	2026-06-10 20:38:12.182336201 +0000
+@@ -1,7 +1,48 @@
+-"""Piano AMT modeling/training package."""
+-from .config import CFG, Config, config_to_json, default_run_name
++"""Piano AMT modeling/training package.
++
++The top-level package keeps imports light so utilities such as decoding and tests do not require the
++full audio/MIDI/model dependency stack at import time. Heavier objects are loaded lazily on access.
++"""
++from __future__ import annotations
++
+ from .common import DEVICE, get_device, setup_runtime
++from .config import CFG, Config, config_to_json, default_run_name
+ from .paths import ProjectPaths, make_colab_paths, print_paths
+-from .models import PianoTranscriptionSystem, count_parameters_millions
+-from .training import load_checkpoint, run_training, save_checkpoint, train_one_epoch, validate_quick
+-from .lr_finder import find_optimal_lr_fastai
++
++_LAZY_EXPORTS = {
++    "PianoTranscriptionSystem": (".models", "PianoTranscriptionSystem"),
++    "count_parameters_millions": (".models", "count_parameters_millions"),
++    "load_checkpoint": (".training", "load_checkpoint"),
++    "run_training": (".training", "run_training"),
++    "save_checkpoint": (".training", "save_checkpoint"),
++    "train_one_epoch": (".training", "train_one_epoch"),
++    "validate_quick": (".training", "validate_quick"),
++    "find_optimal_lr_fastai": (".lr_finder", "find_optimal_lr_fastai"),
++}
++
++
++def __getattr__(name: str):
++    if name not in _LAZY_EXPORTS:
++        raise AttributeError(name)
++    import importlib
++
++    module_name, attr_name = _LAZY_EXPORTS[name]
++    module = importlib.import_module(module_name, __name__)
++    value = getattr(module, attr_name)
++    globals()[name] = value
++    return value
++
++
++__all__ = [
++    "CFG",
++    "Config",
++    "config_to_json",
++    "default_run_name",
++    "DEVICE",
++    "get_device",
++    "setup_runtime",
++    "ProjectPaths",
++    "make_colab_paths",
++    "print_paths",
++    *_LAZY_EXPORTS.keys(),
++]
+diff -ruN piano_amt-main.orig/src/piano_modeling/audio.py piano_amt-main/src/piano_modeling/audio.py
+--- piano_amt-main.orig/src/piano_modeling/audio.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/audio.py	2026-06-10 20:37:52.768318786 +0000
+@@ -7,11 +7,21 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+-import torchaudio
+ 
+ from .config import Config
+ 
+ 
++def _require_torchaudio():
++    try:
++        import torchaudio
++    except (ImportError, OSError) as exc:
++        raise ImportError(
++            "Audio resampling/EQ augmentation requires a working torchaudio install. "
++            "Install the torch/torchaudio build that matches your platform."
++        ) from exc
++    return torchaudio
++
++
+ def load_audio_segment(path: str, start_sec: float, duration_sec: float, target_sr: int) -> torch.Tensor:
+     """Load mono audio segment, resample, pad/truncate to exact duration."""
+     info = sf.info(path)
+@@ -27,6 +37,7 @@
+         audio = audio[:, 0]
+     wav = torch.from_numpy(audio)
+     if native_sr != target_sr and wav.numel() > 0:
++        torchaudio = _require_torchaudio()
+         wav = torchaudio.functional.resample(wav, native_sr, target_sr)
+     target_len = int(round(duration_sec * target_sr))
+     if wav.numel() < target_len:
+@@ -77,9 +88,11 @@
+         if random.random() < cfg.eq_probability:
+             if random.random() < 0.5:
+                 cutoff = random.uniform(40, 180)
++                torchaudio = _require_torchaudio()
+                 x = torchaudio.functional.highpass_biquad(x, cfg.sample_rate, cutoff)
+             else:
+                 cutoff = random.uniform(4500, 7800)
++                torchaudio = _require_torchaudio()
+                 x = torchaudio.functional.lowpass_biquad(x, cfg.sample_rate, cutoff)
+ 
+         return x.clamp(-1.0, 1.0)
+diff -ruN piano_amt-main.orig/src/piano_modeling/config.py piano_amt-main/src/piano_modeling/config.py
+--- piano_amt-main.orig/src/piano_modeling/config.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/config.py	2026-06-10 20:35:19.388990061 +0000
+@@ -26,6 +26,7 @@
+     resnet_name: str = "resnet34.a1_in1k"
+     pretrained: bool = True
+     decoder_channels: int = 256
++    decoder_type: str = "fpn"             # "fpn" uses encoder skip features; "legacy" uses deepest map only.
+     dropout: float = 0.10
+     compile_model: bool = True
+ 
+diff -ruN piano_amt-main.orig/src/piano_modeling/datasets.py piano_amt-main/src/piano_modeling/datasets.py
+--- piano_amt-main.orig/src/piano_modeling/datasets.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/datasets.py	2026-06-10 20:38:13.187919941 +0000
+@@ -15,7 +15,6 @@
+ from .audio import AudioAugmenter, load_audio_segment
+ from .common import DEVICE
+ from .config import CFG, Config
+-from .midi_labels import midi_to_targets
+ 
+ SPEC_LRU_CACHE_SIZE = 64
+ 
+@@ -165,6 +164,8 @@
+     def __getitem__(self, idx: int):
+         row, full_spec, start_sec = self._choose_row_and_start(idx)
+         spec = self._crop_spec(full_spec, start_sec)
++        from .midi_labels import midi_to_targets
++
+         targets = midi_to_targets(row["midi_path"], start_sec, self.cfg.segment_seconds, self.cfg, self.cfg.label_frames)
+         item = {
+             "spec": spec,
+@@ -228,6 +229,8 @@
+         wav = load_audio_segment(row["audio_path"], start, self.cfg.segment_seconds, self.cfg.sample_rate)
+         if self.augment is not None:
+             wav = self.augment(wav)
++        from .midi_labels import midi_to_targets
++
+         targets = midi_to_targets(row["midi_path"], start, self.cfg.segment_seconds, self.cfg, self.cfg.label_frames)
+         item = {"audio": wav, "audio_path": row["audio_path"], "midi_path": row["midi_path"], "start_sec": torch.tensor(start, dtype=torch.float32)}
+         for k, v in targets.items():
+diff -ruN piano_amt-main.orig/src/piano_modeling/evaluation.py piano_amt-main/src/piano_modeling/evaluation.py
+--- piano_amt-main.orig/src/piano_modeling/evaluation.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/evaluation.py	2026-06-10 20:36:45.610714564 +0000
+@@ -1,14 +1,18 @@
+-"""Formal evaluation helpers for note, velocity, and pedal metrics."""
++"""Formal evaluation helpers and CLI for note, velocity, and pedal metrics."""
+ from __future__ import annotations
+ 
++import argparse
++import json
+ import math
++from dataclasses import asdict, fields
+ from pathlib import Path
+-from typing import Optional
++from typing import Mapping, Optional
+ 
+ import mir_eval
+ import numpy as np
+ import pandas as pd
+ import pretty_midi
++import torch
+ from tqdm.auto import tqdm
+ 
+ from .config import CFG, Config
+@@ -19,6 +23,24 @@
+ from .training import load_checkpoint
+ 
+ 
++SUMMARY_METRICS = (
++    "note_onset_precision",
++    "note_onset_recall",
++    "note_onset_f1",
++    "note_onset_offset_precision",
++    "note_onset_offset_recall",
++    "note_onset_offset_f1",
++    "velocity_precision",
++    "velocity_recall",
++    "velocity_f1",
++    "pedal_precision",
++    "pedal_recall",
++    "pedal_f1",
++    "num_pred_notes",
++    "num_ref_notes",
++)
++
++
+ def events_df_to_mir_eval(events: pd.DataFrame):
+     if events is None or len(events) == 0:
+         return np.empty((0, 2)), np.empty((0,)), np.empty((0,))
+@@ -44,7 +66,38 @@
+     p = tp / (tp + fp + 1e-8)
+     r = tp / (tp + fn + 1e-8)
+     f1 = 2 * p * r / (p + r + 1e-8)
+-    return {"precision": p, "recall": r, "f1": f1}
++    return {"precision": float(p), "recall": float(r), "f1": float(f1)}
++
++
++def summarize_evaluation_report(report: pd.DataFrame) -> dict[str, float]:
++    """Return stable numeric summary metrics from a per-track evaluation report."""
++    summary = report.mean(numeric_only=True).to_dict() if len(report) else {}
++    return {k: float(summary[k]) for k in SUMMARY_METRICS if k in summary and pd.notna(summary[k])}
++
++
++def save_evaluation_outputs(report: pd.DataFrame, output_dir: str | Path, stem: str) -> tuple[Path, Path]:
++    """Save per-track CSV and aggregate JSON summary."""
++    output_dir = Path(output_dir)
++    output_dir.mkdir(parents=True, exist_ok=True)
++    csv_path = output_dir / f"{stem}.csv"
++    json_path = output_dir / f"{stem}_summary.json"
++    report.to_csv(csv_path, index=False)
++    json_path.write_text(json.dumps(summarize_evaluation_report(report), indent=2))
++    return csv_path, json_path
++
++
++def config_from_mapping(values: Mapping | None, fallback: Config = CFG) -> Config:
++    """Build Config from a partial mapping while ignoring unknown/stale checkpoint keys."""
++    allowed = {f.name for f in fields(Config)}
++    base = asdict(fallback)
++    if values:
++        base.update({k: v for k, v in values.items() if k in allowed})
++    return Config(**base)
++
++
++def config_from_checkpoint(checkpoint_path: str | Path, fallback: Config = CFG) -> Config:
++    ckpt = torch.load(checkpoint_path, map_location="cpu")
++    return config_from_mapping(ckpt.get("cfg") or {}, fallback=fallback)
+ 
+ 
+ def evaluate_one_track(row: pd.Series, system: PianoTranscriptionSystem, cfg: Config = CFG):
+@@ -88,6 +141,16 @@
+     }
+ 
+ 
++def _filter_existing_split(meta: pd.DataFrame, split: str) -> pd.DataFrame:
++    required = {"audio_path", "midi_path", "split"}
++    missing = sorted(required - set(meta.columns))
++    if missing:
++        raise ValueError(f"metadata is missing required columns: {missing}")
++    df = meta[(meta["split"] == split) & meta["audio_path"].apply(lambda p: Path(p).exists())]
++    df = df[df["midi_path"].apply(lambda p: Path(p).exists())].reset_index(drop=True)
++    return df
++
++
+ def evaluate_split_sample(
+     meta: pd.DataFrame,
+     system: PianoTranscriptionSystem,
+@@ -101,16 +164,88 @@
+ ):
+     if checkpoint_path is not None:
+         load_checkpoint(checkpoint_path, system, map_location=device, cfg=cfg)
++    system.to(device)
+     system.eval()
+-    df = meta[(meta["split"] == split) & meta["audio_path"].apply(lambda p: Path(p).exists())].reset_index(drop=True)
+-    df = df.head(n_tracks)
++    df = _filter_existing_split(meta, split).head(n_tracks)
+     rows = []
+     for _, row in tqdm(df.iterrows(), total=len(df), desc=f"eval {split}"):
+         rows.append(evaluate_one_track(row, system, cfg))
+     report = pd.DataFrame(rows)
++    summary = summarize_evaluation_report(report)
+     print(report)
+-    print(report.mean(numeric_only=True))
+-    out_path = Path(export_dir) / f"eval_{split}_{run_name}.csv"
+-    report.to_csv(out_path, index=False)
+-    print("saved:", out_path)
++    print(pd.Series(summary, name="mean"))
++    stem = f"eval_{split}_{run_name}"
++    csv_path, json_path = save_evaluation_outputs(report, export_dir, stem)
++    print("saved:", csv_path)
++    print("saved:", json_path)
+     return report
++
++
++def evaluate_checkpoint(
++    metadata_csv: str | Path,
++    checkpoint_path: str | Path,
++    output_dir: str | Path,
++    *,
++    split: str = "test",
++    n_tracks: int = 20,
++    run_name: Optional[str] = None,
++    cfg: Optional[Config] = None,
++    device: str = "cuda",
++) -> pd.DataFrame:
++    """Load a checkpoint and metadata CSV, run formal evaluation, and save reports."""
++    checkpoint_path = Path(checkpoint_path)
++    cfg = cfg or config_from_checkpoint(checkpoint_path)
++    run_name = run_name or checkpoint_path.parent.name or checkpoint_path.stem
++    meta = pd.read_csv(metadata_csv)
++    system = PianoTranscriptionSystem(cfg).to(device)
++    return evaluate_split_sample(
++        meta,
++        system,
++        output_dir,
++        run_name,
++        split=split,
++        n_tracks=n_tracks,
++        checkpoint_path=checkpoint_path,
++        cfg=cfg,
++        device=device,
++    )
++
++
++def build_arg_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="Evaluate a piano AMT checkpoint on paired audio/MIDI metadata.")
++    parser.add_argument("--metadata-csv", required=True, help="CSV with audio_path, midi_path, and split columns")
++    parser.add_argument("--checkpoint", required=True, help="Path to a .pt checkpoint")
++    parser.add_argument("--output-dir", default="evaluation_reports", help="Directory for CSV/JSON outputs")
++    parser.add_argument("--split", default="test", help="Metadata split to evaluate")
++    parser.add_argument("--n-tracks", type=int, default=20, help="Number of tracks from the split to evaluate")
++    parser.add_argument("--run-name", default=None, help="Optional report name suffix; defaults to checkpoint parent")
++    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    parser.add_argument(
++        "--config-json",
++        default=None,
++        help="Optional JSON file with Config overrides. Checkpoint config is used as the base.",
++    )
++    return parser
++
++
++def main(argv: Optional[list[str]] = None) -> None:
++    args = build_arg_parser().parse_args(argv)
++    cfg = config_from_checkpoint(args.checkpoint)
++    if args.config_json:
++        overrides = json.loads(Path(args.config_json).read_text())
++        cfg = config_from_mapping(overrides, fallback=cfg)
++    report = evaluate_checkpoint(
++        args.metadata_csv,
++        args.checkpoint,
++        args.output_dir,
++        split=args.split,
++        n_tracks=args.n_tracks,
++        run_name=args.run_name,
++        cfg=cfg,
++        device=args.device,
++    )
++    print(json.dumps(summarize_evaluation_report(report), indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN piano_amt-main.orig/src/piano_modeling/frontend.py piano_amt-main/src/piano_modeling/frontend.py
+--- piano_amt-main.orig/src/piano_modeling/frontend.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/frontend.py	2026-06-10 20:35:26.921787270 +0000
+@@ -3,8 +3,6 @@
+ 
+ import torch
+ import torch.nn as nn
+-import torchaudio
+-
+ from .audio import SpecAugment
+ from .config import Config
+ 
+@@ -15,6 +13,13 @@
+         self.cfg = cfg
+         self.specaugment = SpecAugment(cfg)
+         if cfg.feature_type.lower() == "mel":
++            try:
++                import torchaudio
++            except (ImportError, OSError) as exc:
++                raise ImportError(
++                    "Mel spectrogram frontend requires a working torchaudio install. "
++                    "Install the torch/torchaudio build that matches your platform."
++                ) from exc
+             self.transform = torchaudio.transforms.MelSpectrogram(
+                 sample_rate=cfg.sample_rate,
+                 n_fft=cfg.n_fft,
+diff -ruN piano_amt-main.orig/src/piano_modeling/models.py piano_amt-main/src/piano_modeling/models.py
+--- piano_amt-main.orig/src/piano_modeling/models.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/models.py	2026-06-10 20:35:18.453039130 +0000
+@@ -1,9 +1,9 @@
+-"""ResNet-based multi-head piano transcription model."""
++"""Multi-head piano transcription models."""
+ from __future__ import annotations
+ 
+-from typing import Dict, Optional
++import importlib
++from typing import Dict, Optional, Sequence
+ 
+-import timm
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -26,10 +26,63 @@
+         return self.net(x)
+ 
+ 
++class FeaturePyramidDecoder(nn.Module):
++    """Top-down skip decoder that preserves earlier time/frequency detail.
++
++    The original prototype decoded only the deepest ResNet feature map. That is compact, but the
++    deepest map is also the most downsampled in time. This decoder keeps the public model contract
++    unchanged while fusing all encoder stages into a higher-resolution piano-roll representation.
++    It is intentionally generic: any ``timm`` features-only encoder that returns a list of feature
++    maps and channel counts can be used.
++    """
++
++    def __init__(self, encoder_channels: Sequence[int], out_ch: int, dropout: float = 0.0):
++        super().__init__()
++        if len(encoder_channels) == 0:
++            raise ValueError("FeaturePyramidDecoder requires at least one encoder stage")
++        self.laterals = nn.ModuleList([nn.Conv2d(ch, out_ch, kernel_size=1) for ch in encoder_channels])
++        self.refines = nn.ModuleList(
++            [ConvBNAct(out_ch, out_ch, 3, 1, dropout) for _ in encoder_channels]
++        )
++        self.fuse = nn.Sequential(
++            ConvBNAct(out_ch * len(encoder_channels), out_ch, 3, 1, dropout),
++            ConvBNAct(out_ch, out_ch, 3, 1, dropout),
++        )
++
++    def forward(self, features: Sequence[torch.Tensor], target_size: tuple[int, int]) -> torch.Tensor:
++        if len(features) != len(self.laterals):
++            raise ValueError(f"Expected {len(self.laterals)} feature maps, got {len(features)}")
++
++        top_down: Optional[torch.Tensor] = None
++        fused_at_target = []
++        for feat, lateral, refine in zip(
++            reversed(features), reversed(self.laterals), reversed(self.refines), strict=True
++        ):
++            current = lateral(feat)
++            if top_down is not None:
++                top_down = F.interpolate(
++                    top_down, size=current.shape[-2:], mode="bilinear", align_corners=False
++                )
++                current = current + top_down
++            top_down = refine(current)
++            fused_at_target.append(
++                F.interpolate(top_down, size=target_size, mode="bilinear", align_corners=False)
++            )
++        return self.fuse(torch.cat(list(reversed(fused_at_target)), dim=1))
++
++
+ class ResNetPianoTranscriber(nn.Module):
+     def __init__(self, cfg: Config):
+         super().__init__()
+         self.cfg = cfg
++        try:
++            timm = importlib.import_module("timm")
++        except ImportError as exc:
++            raise ImportError(
++                "ResNetPianoTranscriber requires the optional dependency 'timm'. "
++                "Install with `pip install -e .` or `pip install -e '.[train]'`."
++            ) from exc
++
+         self.encoder = timm.create_model(
+             cfg.resnet_name,
+             pretrained=cfg.pretrained,
+@@ -37,12 +90,22 @@
+             in_chans=3,
+             out_indices=(1, 2, 3, 4),
+         )
+-        enc_ch = self.encoder.feature_info.channels()[-1]
++        encoder_channels = list(self.encoder.feature_info.channels())
+         ch = cfg.decoder_channels
+-        self.neck = nn.Sequential(
+-            ConvBNAct(enc_ch, ch, 3, 1, cfg.dropout),
+-            ConvBNAct(ch, ch, 3, 1, cfg.dropout),
+-        )
++        decoder_type = cfg.decoder_type.lower()
++        self.decoder_type = decoder_type
++
++        if decoder_type == "legacy":
++            enc_ch = encoder_channels[-1]
++            self.decoder = nn.Sequential(
++                ConvBNAct(enc_ch, ch, 3, 1, cfg.dropout),
++                ConvBNAct(ch, ch, 3, 1, cfg.dropout),
++            )
++        elif decoder_type == "fpn":
++            self.decoder = FeaturePyramidDecoder(encoder_channels, ch, cfg.dropout)
++        else:
++            raise ValueError("cfg.decoder_type must be either 'fpn' or 'legacy'")
++
+         self.shared = nn.Sequential(
+             ConvBNAct(ch, ch, 3, 1, cfg.dropout),
+             ConvBNAct(ch, ch // 2, 3, 1, cfg.dropout),
+@@ -53,19 +116,25 @@
+         self.frame_head = nn.Conv2d(out_ch, 1, kernel_size=1)
+         self.velocity_head = nn.Conv2d(out_ch, 1, kernel_size=1)
+         self.sustain_head = nn.Sequential(
+-            ConvBNAct(out_ch, out_ch // 2, 3, 1, cfg.dropout),
+-            nn.Conv2d(out_ch // 2, 1, kernel_size=1),
++            ConvBNAct(out_ch, max(1, out_ch // 2), 3, 1, cfg.dropout),
++            nn.Conv2d(max(1, out_ch // 2), 1, kernel_size=1),
+         )
+ 
+     def _pitch_time(self, head: nn.Module, z: torch.Tensor) -> torch.Tensor:
+         return head(z).squeeze(1).transpose(1, 2).contiguous()  # [B, T, P]
+ 
++    def _decode_features(self, features: Sequence[torch.Tensor], target_frames: int) -> torch.Tensor:
++        target_size = (self.cfg.n_pitches, target_frames)
++        if self.decoder_type == "legacy":
++            z = self.decoder(features[-1])
++            return F.interpolate(z, size=target_size, mode="bilinear", align_corners=False)
++        return self.decoder(features, target_size=target_size)
++
+     def forward(self, feat: torch.Tensor, target_frames: Optional[int] = None) -> Dict[str, torch.Tensor]:
+         target_frames = target_frames or feat.shape[-1]
+         features = self.encoder(feat)
+-        z = self.neck(features[-1])
++        z = self._decode_features(features, target_frames)
+         z = self.shared(z)
+-        z = F.interpolate(z, size=(self.cfg.n_pitches, target_frames), mode="bilinear", align_corners=False)
+         sustain_logits = self.sustain_head(z).squeeze(1).mean(dim=1)  # [B, T]
+         return {
+             "onset": self._pitch_time(self.onset_head, z),
+diff -ruN piano_amt-main.orig/src/piano_modeling/tensorboard_debug.py piano_amt-main/src/piano_modeling/tensorboard_debug.py
+--- piano_amt-main.orig/src/piano_modeling/tensorboard_debug.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/src/piano_modeling/tensorboard_debug.py	2026-06-10 20:39:08.157217736 +0000
+@@ -0,0 +1,220 @@
++"""TensorBoard/SummaryWriter debugging helpers.
++
++These helpers deliberately avoid assumptions about the concrete model architecture. They log what
++is available through the stable training contract: a model input tensor, an output dictionary, the
++batch targets, optional loss scalars, and named model parameters/gradients.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any, Mapping, Optional
++
++import torch
++import torch.nn as nn
++
++
++OUTPUT_KEYS = ("onset", "offset", "frame", "velocity", "sustain")
++
++
++def create_summary_writer(log_dir: str | Path | None, enabled: bool = True):
++    """Create a TensorBoard SummaryWriter, returning ``None`` when unavailable/disabled."""
++    if not enabled or log_dir is None:
++        return None
++    try:
++        from torch.utils.tensorboard import SummaryWriter
++    except Exception as exc:  # pragma: no cover - depends on optional tensorboard install
++        print(f"TensorBoard logging disabled: could not import SummaryWriter ({exc})")
++        return None
++    Path(log_dir).mkdir(parents=True, exist_ok=True)
++    return SummaryWriter(log_dir=str(log_dir))
++
++
++def _sample_flat(x: torch.Tensor, max_points: int = 200_000) -> torch.Tensor:
++    x = x.detach().float().flatten().cpu()
++    if x.numel() > max_points:
++        idx = torch.linspace(0, x.numel() - 1, max_points).long()
++        x = x[idx]
++    return x
++
++
++def _normalize_image(x: torch.Tensor) -> torch.Tensor:
++    x = x.detach().float().cpu()
++    lo, hi = torch.nan_to_num(x).min(), torch.nan_to_num(x).max()
++    return (x - lo) / (hi - lo).clamp_min(1e-6)
++
++
++def _first_image_from_tensor(x: torch.Tensor) -> Optional[torch.Tensor]:
++    """Return a [1, H, W] image from common model input/output tensor shapes."""
++    if not torch.is_tensor(x) or x.numel() == 0:
++        return None
++    x = x.detach()
++    if x.ndim == 4:  # [B, C, F, T]
++        img = x[0, 0]
++    elif x.ndim == 3:  # [B, F, T] or [B, T, P]
++        img = x[0]
++    elif x.ndim == 2:
++        img = x
++    else:
++        return None
++    return _normalize_image(img).unsqueeze(0)
++
++
++def log_scalar_dict(writer, prefix: str, values: Mapping[str, Any], step: int) -> None:
++    if writer is None:
++        return
++    for key, value in values.items():
++        try:
++            if torch.is_tensor(value):
++                value = float(value.detach().cpu())
++            if isinstance(value, (int, float)):
++                writer.add_scalar(f"{prefix}/{key}", value, step)
++        except Exception:
++            continue
++
++
++def log_epoch_metrics(writer, train_stats: Mapping[str, float], val_stats: Mapping[str, float], epoch: int) -> None:
++    """Log epoch-level metrics under stable namespaces."""
++    log_scalar_dict(writer, "epoch/train", train_stats, epoch)
++    log_scalar_dict(writer, "epoch/validation", val_stats, epoch)
++    if writer is not None:
++        writer.flush()
++
++
++class _GraphTraceWrapper(nn.Module):
++    """Trace-friendly wrapper for models that return dictionaries."""
++
++    def __init__(self, model: nn.Module, target_frames: Optional[int]):
++        super().__init__()
++        self.model = model
++        self.target_frames = target_frames
++
++    def forward(self, x: torch.Tensor):
++        out = self.model(x, target_frames=self.target_frames)
++        return tuple(out[k] for k in OUTPUT_KEYS if k in out)
++
++
++def try_add_model_graph(writer, model: nn.Module, model_input: torch.Tensor, target_frames: Optional[int]) -> bool:
++    """Best-effort graph trace. Returns True when a graph was logged.
++
++    The model's original train/eval mode is restored because this helper can be called from inside
++    the training loop.
++    """
++    if writer is None:
++        return False
++    was_training = model.training
++    try:
++        model.eval()
++        wrapper = _GraphTraceWrapper(model, target_frames)
++        writer.add_graph(wrapper, model_input[:1].detach())
++        return True
++    except Exception as exc:  # pragma: no cover - tracing may fail on some dynamic architectures
++        writer.add_text("debug/graph_trace_warning", str(exc), 0)
++        return False
++    finally:
++        model.train(was_training)
++
++
++def _threshold_for_key(key: str, cfg) -> float:
++    if key == "onset":
++        return float(getattr(cfg, "onset_threshold", 0.5))
++    if key == "offset":
++        return float(getattr(cfg, "offset_threshold", 0.5))
++    if key == "frame":
++        return float(getattr(cfg, "frame_threshold", 0.5))
++    return 0.5
++
++
++def _add_pr_curve(writer, tag: str, target: torch.Tensor, prob: torch.Tensor, step: int) -> None:
++    labels = _sample_flat(target >= 0.5, max_points=50_000).bool()
++    preds = _sample_flat(prob, max_points=50_000)
++    if labels.numel() == 0 or labels.float().sum() == 0:
++        return
++    writer.add_pr_curve(tag, labels, preds, step)
++
++
++def log_model_debug_batch(
++    writer,
++    model: nn.Module,
++    model_input: torch.Tensor,
++    batch: Mapping[str, Any],
++    pred: Mapping[str, torch.Tensor],
++    loss_dict: Optional[Mapping[str, float]],
++    cfg,
++    step: int,
++    *,
++    max_parameter_histograms: int = 24,
++) -> None:
++    """Log architecture-agnostic model debugging signals.
++
++    Important things to watch in TensorBoard:
++    - loss components and validation F1 by head;
++    - output probability histograms, especially saturated all-zero/all-one heads;
++    - target density vs prediction activation rate;
++    - PR curves for sparse heads such as onset/offset;
++    - parameter and gradient histograms/norms for dead or exploding layers;
++    - visual spectrogram/probability images for quick sanity checks.
++    """
++    if writer is None:
++        return
++
++    if loss_dict:
++        log_scalar_dict(writer, "batch/loss", loss_dict, step)
++
++    img = _first_image_from_tensor(model_input)
++    if img is not None:
++        writer.add_image("debug/input_channel0", img, step)
++
++    for key in OUTPUT_KEYS:
++        if key not in pred:
++            continue
++        logits = pred[key].detach()
++        prob = torch.sigmoid(logits)
++        threshold = _threshold_for_key(key, cfg)
++        writer.add_histogram(f"debug_logits/{key}", _sample_flat(logits), step)
++        writer.add_histogram(f"debug_probabilities/{key}", _sample_flat(prob), step)
++        writer.add_scalar(f"debug_probabilities/{key}_mean", float(prob.mean().cpu()), step)
++        writer.add_scalar(f"debug_probabilities/{key}_max", float(prob.max().cpu()), step)
++        writer.add_scalar(
++            f"debug_activation_rate/{key}_at_threshold",
++            float((prob >= threshold).float().mean().cpu()),
++            step,
++        )
++
++        if key in batch and torch.is_tensor(batch[key]):
++            target = batch[key].detach()
++            writer.add_scalar(f"debug_target_density/{key}", float((target >= 0.5).float().mean().cpu()), step)
++            try:
++                _add_pr_curve(writer, f"debug_pr_curve/{key}", target, prob, step)
++            except Exception:
++                pass
++            target_img = _first_image_from_tensor(target)
++            if target_img is not None and key in {"onset", "frame", "offset"}:
++                writer.add_image(f"debug_targets/{key}", target_img, step)
++
++        prob_img = _first_image_from_tensor(prob)
++        if prob_img is not None and key in {"onset", "frame", "offset", "velocity"}:
++            writer.add_image(f"debug_predictions/{key}", prob_img, step)
++
++    total_param_norm_sq = 0.0
++    total_grad_norm_sq = 0.0
++    histograms_logged = 0
++    for name, param in model.named_parameters():
++        if not param.requires_grad:
++            continue
++        param_norm = float(param.detach().float().norm().cpu())
++        total_param_norm_sq += param_norm**2
++        writer.add_scalar(f"debug_param_norm/{name}", param_norm, step)
++        if histograms_logged < max_parameter_histograms:
++            writer.add_histogram(f"debug_parameters/{name}", _sample_flat(param), step)
++            histograms_logged += 1
++        if param.grad is not None:
++            grad_norm = float(param.grad.detach().float().norm().cpu())
++            total_grad_norm_sq += grad_norm**2
++            writer.add_scalar(f"debug_grad_norm/{name}", grad_norm, step)
++            if histograms_logged < max_parameter_histograms:
++                writer.add_histogram(f"debug_gradients/{name}", _sample_flat(param.grad), step)
++                histograms_logged += 1
++
++    writer.add_scalar("debug_global_norm/parameters", total_param_norm_sq**0.5, step)
++    writer.add_scalar("debug_global_norm/gradients", total_grad_norm_sq**0.5, step)
++    writer.flush()
+diff -ruN piano_amt-main.orig/src/piano_modeling/training.py piano_amt-main/src/piano_modeling/training.py
+--- piano_amt-main.orig/src/piano_modeling/training.py	2026-06-03 21:46:56.000000000 +0000
++++ piano_amt-main/src/piano_modeling/training.py	2026-06-10 20:36:20.136297830 +0000
+@@ -1,4 +1,4 @@
+-"""Training, validation, checkpointing, and run orchestration."""
++"""Training, validation, checkpointing, TensorBoard logging, and run orchestration."""
+ from __future__ import annotations
+ 
+ from dataclasses import asdict
+@@ -10,10 +10,17 @@
+ from tqdm.auto import tqdm
+ 
+ from .common import DEVICE
+-from .config import Config, default_run_name
++from .config import Config, config_to_json, default_run_name
+ from .datasets import make_sliced_loaders
+ from .losses import compute_loss, move_batch_to_device
+ from .paths import ProjectPaths
++from .tensorboard_debug import (
++    create_summary_writer,
++    log_epoch_metrics,
++    log_model_debug_batch,
++    log_scalar_dict,
++    try_add_model_graph,
++)
+ 
+ 
+ def save_checkpoint(path: Path, system, optimizer, epoch: int, cfg: Config, best_metric: float, extra: Optional[dict] = None) -> None:
+@@ -37,7 +44,7 @@
+     keys = [
+         "feature_type", "sample_rate", "hop_length", "n_fft", "n_mels",
+         "f_min", "f_max", "segment_seconds", "midi_min", "midi_max",
+-        "resnet_name", "decoder_channels",
++        "resnet_name", "decoder_channels", "decoder_type",
+     ]
+     mismatches = []
+     current = asdict(cfg)
+@@ -67,24 +74,47 @@
+     return batch["spec"] if "spec" in batch else batch["audio"]
+ 
+ 
+-def train_one_epoch(system, loader, optimizer, scaler, cfg: Config, epoch: int, device: str = DEVICE):
++def train_one_epoch(
++    system,
++    loader,
++    optimizer,
++    scaler,
++    cfg: Config,
++    epoch: int,
++    device: str = DEVICE,
++    *,
++    writer=None,
++    tensorboard_log_every: int = 100,
++    tensorboard_log_graph: bool = False,
++):
+     system.train()
+     loss_sums, n_examples = {}, 0
+     ema = {}
++    graph_logged = False
+     pbar = tqdm(loader, desc=f"train epoch {epoch}", leave=False)
+     for i, batch in enumerate(pbar):
+         batch = move_batch_to_device(batch, device)
+         model_input = model_input_from_batch(batch)
++        global_step = max(0, epoch - 1) * max(1, len(loader)) + i
+         if i == 0 and device == "cuda":
+             mem_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+             mem_res = torch.cuda.memory_reserved() / (1024 ** 3)
+             print(f"\n[GPU Memory - Batch 0] Allocated: {mem_alloc:.2f} GB, Reserved: {mem_res:.2f} GB")
++            log_scalar_dict(
++                writer,
++                "debug_cuda_memory_gb",
++                {"allocated": mem_alloc, "reserved": mem_res},
++                global_step,
++            )
+ 
+         optimizer.zero_grad(set_to_none=True)
+         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(cfg.use_amp and device == "cuda")):
+             pred = system(model_input, target_frames=batch["frame"].shape[1])
+             loss, loss_dict = compute_loss(pred, batch, cfg)
+ 
++        if writer is not None and tensorboard_log_graph and not graph_logged:
++            graph_logged = try_add_model_graph(writer, system, model_input, int(batch["frame"].shape[1]))
++
+         if scaler is not None and scaler.is_enabled():
+             scaler.scale(loss).backward()
+             if cfg.grad_clip:
+@@ -98,6 +128,9 @@
+                 torch.nn.utils.clip_grad_norm_(system.parameters(), cfg.grad_clip)
+             optimizer.step()
+ 
++        if writer is not None and tensorboard_log_every > 0 and i % tensorboard_log_every == 0:
++            log_model_debug_batch(writer, system, model_input, batch, pred, loss_dict, cfg, global_step)
++
+         bs = int(model_input.shape[0])
+         n_examples += bs
+         for k, v in loss_dict.items():
+@@ -126,7 +159,7 @@
+ 
+ @torch.no_grad()
+ def validate_quick(system, loader, cfg: Config, device: str = DEVICE):
+-    """Validation with epoch-averaged losses and globally accumulated F1 counts."""
++    """Validation with epoch-averaged losses and globally accumulated dense-label F1 counts."""
+     system.eval()
+     loss_sums, n_examples = {}, 0
+     counts = {
+@@ -174,8 +207,21 @@
+     val_samples: int = 0,
+     resume: bool = True,
+     device: str = DEVICE,
++    *,
++    enable_tensorboard: bool = True,
++    tensorboard_log_dir: Optional[str | Path] = None,
++    tensorboard_log_every: int = 100,
++    tensorboard_log_graph: bool = True,
++    formal_eval_meta: Optional[pd.DataFrame] = None,
++    formal_eval_split: str = "validation",
++    formal_eval_n_tracks: int = 0,
+ ):
+-    """Create loaders/optimizer/checkpoints and run the training loop."""
++    """Create loaders/optimizer/checkpoints and run the training loop.
++
++    ``validate_quick`` remains the cheap per-epoch dense-label check. When ``formal_eval_meta`` and
++    ``formal_eval_n_tracks`` are provided, the run also performs note-level evaluation with the same
++    machinery used by the ``piano-evaluate`` CLI whenever a new best checkpoint is found.
++    """
+     if torch.cuda.is_available():
+         torch.cuda.empty_cache()
+ 
+@@ -198,6 +244,12 @@
+     best_ckpt = run_dir / "best.pt"
+     run_dir.mkdir(parents=True, exist_ok=True)
+ 
++    writer_dir = Path(tensorboard_log_dir) if tensorboard_log_dir is not None else run_dir / "tensorboard"
++    writer = create_summary_writer(writer_dir, enabled=enable_tensorboard)
++    if writer is not None:
++        writer.add_text("config/json", f"```json\n{config_to_json(cfg)}\n```", 0)
++        writer.add_text("run/name", run_name, 0)
++
+     start_epoch = 1
+     best_metric = -1.0
+     history = []
+@@ -212,24 +264,65 @@
+ 
+     print("Run directory:", run_dir)
+     print("RUN_NAME:", run_name)
++    if writer is not None:
++        print("TensorBoard log directory:", writer_dir)
+ 
+-    for epoch in range(start_epoch, cfg.epochs + 1):
+-        train_stats = train_one_epoch(system, train_loader, optimizer, scaler, cfg, epoch, device=device)
+-        val_stats = validate_quick(system, val_loader, cfg, device=device)
+-        metric = val_stats.get("onset_f1", 0.0) + val_stats.get("frame_f1", 0.0) + val_stats.get("offset_f1", 0.0)
+-        row = {
+-            "epoch": epoch,
+-            **{f"train_{k}": v for k, v in train_stats.items()},
+-            **{f"val_{k}": v for k, v in val_stats.items()},
+-        }
+-        history.append(row)
+-        pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
+-        save_checkpoint(last_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
+-        if metric > best_metric:
+-            best_metric = metric
+-            save_checkpoint(best_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
+-            print(f"Epoch {epoch}: new best metric={best_metric:.4f}; saved {best_ckpt}")
+-        print(row)
++    try:
++        for epoch in range(start_epoch, cfg.epochs + 1):
++            train_stats = train_one_epoch(
++                system,
++                train_loader,
++                optimizer,
++                scaler,
++                cfg,
++                epoch,
++                device=device,
++                writer=writer,
++                tensorboard_log_every=tensorboard_log_every,
++                tensorboard_log_graph=(tensorboard_log_graph and epoch == start_epoch),
++            )
++            val_stats = validate_quick(system, val_loader, cfg, device=device)
++            metric = val_stats.get("onset_f1", 0.0) + val_stats.get("frame_f1", 0.0) + val_stats.get("offset_f1", 0.0)
++            is_best = metric > best_metric
++            if is_best:
++                best_metric = metric
++
++            row = {
++                "epoch": epoch,
++                **{f"train_{k}": v for k, v in train_stats.items()},
++                **{f"val_{k}": v for k, v in val_stats.items()},
++                "selection_metric": metric,
++                "best_metric": best_metric,
++            }
++            history.append(row)
++            pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
++            save_checkpoint(last_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
++            if is_best:
++                save_checkpoint(best_ckpt, system, optimizer, epoch, cfg, best_metric, {"history": history})
++                print(f"Epoch {epoch}: new best metric={best_metric:.4f}; saved {best_ckpt}")
++                if formal_eval_meta is not None and formal_eval_n_tracks and formal_eval_n_tracks > 0:
++                    from .evaluation import evaluate_split_sample, summarize_evaluation_report
++
++                    report = evaluate_split_sample(
++                        formal_eval_meta,
++                        system,
++                        paths.export_dir,
++                        run_name,
++                        split=formal_eval_split,
++                        n_tracks=formal_eval_n_tracks,
++                        checkpoint_path=None,
++                        cfg=cfg,
++                        device=device,
++                    )
++                    formal_summary = summarize_evaluation_report(report)
++                    row.update({f"formal_eval_{k}": v for k, v in formal_summary.items()})
++                    log_scalar_dict(writer, "epoch/formal_eval", formal_summary, epoch)
++            log_epoch_metrics(writer, train_stats, val_stats, epoch)
++            print(row)
++    finally:
++        if writer is not None:
++            writer.flush()
++            writer.close()
+ 
+     return {
+         "run_name": run_name,
+@@ -241,4 +334,5 @@
+         "val_loader": val_loader,
+         "train_ds": train_ds,
+         "val_ds": val_ds,
++        "tensorboard_dir": writer_dir if enable_tensorboard else None,
+     }
+diff -ruN piano_amt-main.orig/tests/test_decoding_smoke.py piano_amt-main/tests/test_decoding_smoke.py
+--- piano_amt-main.orig/tests/test_decoding_smoke.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/tests/test_decoding_smoke.py	2026-06-10 20:37:31.956670243 +0000
+@@ -0,0 +1,48 @@
++import numpy as np
++
++from piano_modeling.config import Config
++from piano_modeling.decoding import decode_notes_from_probs, decode_pedal_from_probs
++
++
++def test_decode_single_note_from_synthetic_probabilities():
++    cfg = Config(
++        midi_min=60,
++        midi_max=63,
++        sample_rate=100,
++        hop_length=10,
++        onset_threshold=0.5,
++        frame_threshold=0.35,
++        offset_threshold=0.35,
++        min_note_seconds=0.1,
++        merge_onset_seconds=0.0,
++    )
++    T, P = 12, cfg.n_pitches
++    onset = np.zeros((T, P), dtype=np.float32)
++    frame = np.zeros((T, P), dtype=np.float32)
++    offset = np.zeros((T, P), dtype=np.float32)
++    velocity = np.zeros((T, P), dtype=np.float32)
++
++    onset[2, 1] = 0.95
++    frame[2:7, 1] = 0.9
++    offset[7, 1] = 0.8
++    velocity[2, 1] = 0.5
++
++    events = decode_notes_from_probs(onset, frame, offset, velocity, cfg)
++
++    assert len(events) == 1
++    event = events.iloc[0]
++    assert event["midi_pitch"] == 61
++    assert event["onset_sec"] == 0.2
++    assert event["offset_sec"] == 0.7
++    assert 60 <= event["velocity"] <= 65
++
++
++def test_decode_pedal_segments():
++    cfg = Config(sample_rate=100, hop_length=10)
++    sustain = np.array([0.0, 0.7, 0.8, 0.2, 0.1, 0.9], dtype=np.float32)
++    events = decode_pedal_from_probs(sustain, cfg)
++
++    assert len(events) == 2
++    assert events.iloc[0]["onset_sec"] == 0.1
++    assert events.iloc[0]["offset_sec"] == 0.3
++    assert events.iloc[1]["onset_sec"] == 0.5
+diff -ruN piano_amt-main.orig/tests/test_evaluation_smoke.py piano_amt-main/tests/test_evaluation_smoke.py
+--- piano_amt-main.orig/tests/test_evaluation_smoke.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/tests/test_evaluation_smoke.py	2026-06-10 20:37:31.986844224 +0000
+@@ -0,0 +1,39 @@
++import pytest
++
++
++def test_frame_prf_and_summary_helpers():
++    pytest.importorskip("mir_eval")
++    pytest.importorskip("pretty_midi")
++    import numpy as np
++    import pandas as pd
++
++    from piano_modeling.evaluation import frame_prf, summarize_evaluation_report
++
++    metrics = frame_prf(np.array([1, 1, 0, 0]), np.array([1, 0, 1, 0]))
++    assert 0.0 <= metrics["precision"] <= 1.0
++    assert 0.0 <= metrics["recall"] <= 1.0
++    assert 0.0 <= metrics["f1"] <= 1.0
++
++    report = pd.DataFrame(
++        [
++            {
++                "note_onset_f1": 0.25,
++                "note_onset_offset_f1": 0.2,
++                "velocity_f1": 0.1,
++                "pedal_f1": 0.5,
++                "num_pred_notes": 10,
++                "num_ref_notes": 12,
++            },
++            {
++                "note_onset_f1": 0.75,
++                "note_onset_offset_f1": 0.4,
++                "velocity_f1": 0.3,
++                "pedal_f1": 0.7,
++                "num_pred_notes": 14,
++                "num_ref_notes": 12,
++            },
++        ]
++    )
++    summary = summarize_evaluation_report(report)
++    assert summary["note_onset_f1"] == 0.5
++    assert summary["num_ref_notes"] == 12.0
+diff -ruN piano_amt-main.orig/tests/test_model_decoder_smoke.py piano_amt-main/tests/test_model_decoder_smoke.py
+--- piano_amt-main.orig/tests/test_model_decoder_smoke.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/tests/test_model_decoder_smoke.py	2026-06-10 20:37:31.971059082 +0000
+@@ -0,0 +1,69 @@
++import sys
++import types
++
++import torch
++import torch.nn as nn
++
++from piano_modeling.config import Config
++from piano_modeling.models import ResNetPianoTranscriber
++
++
++class _FeatureInfo:
++    def channels(self):
++        return [4, 8, 16, 32]
++
++
++class _TinyEncoder(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.feature_info = _FeatureInfo()
++        self.blocks = nn.ModuleList(
++            [
++                nn.Conv2d(3, 4, kernel_size=3, padding=1),
++                nn.Conv2d(4, 8, kernel_size=3, padding=1),
++                nn.Conv2d(8, 16, kernel_size=3, padding=1),
++                nn.Conv2d(16, 32, kernel_size=3, padding=1),
++            ]
++        )
++
++    def forward(self, x):
++        features = []
++        for block in self.blocks:
++            x = torch.relu(block(x))
++            features.append(x)
++            if min(x.shape[-2:]) > 2:
++                x = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
++        return features
++
++
++def test_fpn_decoder_outputs_piano_roll_shapes(monkeypatch):
++    fake_timm = types.SimpleNamespace(create_model=lambda *args, **kwargs: _TinyEncoder())
++    monkeypatch.setitem(sys.modules, "timm", fake_timm)
++
++    cfg = Config(
++        midi_min=60,
++        midi_max=63,
++        n_mels=32,
++        pretrained=False,
++        decoder_channels=8,
++        decoder_type="fpn",
++        enable_spec_augment=False,
++    )
++    model = ResNetPianoTranscriber(cfg)
++    out = model(torch.randn(2, 3, 32, 12), target_frames=10)
++
++    for key in ["onset", "offset", "frame", "velocity"]:
++        assert out[key].shape == (2, 10, cfg.n_pitches)
++    assert out["sustain"].shape == (2, 10)
++
++
++def test_legacy_decoder_still_available(monkeypatch):
++    fake_timm = types.SimpleNamespace(create_model=lambda *args, **kwargs: _TinyEncoder())
++    monkeypatch.setitem(sys.modules, "timm", fake_timm)
++
++    cfg = Config(midi_min=60, midi_max=63, pretrained=False, decoder_channels=8, decoder_type="legacy")
++    model = ResNetPianoTranscriber(cfg)
++    out = model(torch.randn(1, 3, 32, 12), target_frames=7)
++
++    assert out["onset"].shape == (1, 7, cfg.n_pitches)
++    assert out["sustain"].shape == (1, 7)
+diff -ruN piano_amt-main.orig/tests/test_tensorboard_debug_smoke.py piano_amt-main/tests/test_tensorboard_debug_smoke.py
+--- piano_amt-main.orig/tests/test_tensorboard_debug_smoke.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/tests/test_tensorboard_debug_smoke.py	2026-06-10 20:37:31.979093860 +0000
+@@ -0,0 +1,55 @@
++import torch
++import torch.nn as nn
++
++from piano_modeling.config import Config
++from piano_modeling.tensorboard_debug import log_model_debug_batch
++
++
++class DummyWriter:
++    def __init__(self):
++        self.scalars = []
++        self.histograms = []
++        self.images = []
++
++    def add_scalar(self, tag, scalar_value, global_step=None):
++        self.scalars.append(tag)
++
++    def add_histogram(self, tag, values, global_step=None):
++        self.histograms.append(tag)
++
++    def add_image(self, tag, img_tensor, global_step=None):
++        self.images.append(tag)
++
++    def add_pr_curve(self, tag, labels, predictions, global_step=None):
++        pass
++
++    def flush(self):
++        pass
++
++
++class TinyModel(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.proj = nn.Linear(2, 2)
++
++
++def test_log_model_debug_batch_accepts_generic_output_dict():
++    cfg = Config(midi_min=60, midi_max=61)
++    writer = DummyWriter()
++    model = TinyModel()
++    model_input = torch.randn(2, 4, 5)
++    batch = {
++        "onset": torch.zeros(2, 5, cfg.n_pitches),
++        "offset": torch.zeros(2, 5, cfg.n_pitches),
++        "frame": torch.zeros(2, 5, cfg.n_pitches),
++        "velocity": torch.zeros(2, 5, cfg.n_pitches),
++        "sustain": torch.zeros(2, 5),
++    }
++    pred = {k: torch.randn_like(v) for k, v in batch.items()}
++
++    log_model_debug_batch(writer, model, model_input, batch, pred, {"total": 1.0}, cfg, step=0)
++
++    assert "batch/loss/total" in writer.scalars
++    assert "debug_probabilities/onset_mean" in writer.scalars
++    assert any(tag.startswith("debug_logits/onset") for tag in writer.histograms)
++    assert "debug/input_channel0" in writer.images
+diff -ruN piano_amt-main.orig/tests/test_training_smoke.py piano_amt-main/tests/test_training_smoke.py
+--- piano_amt-main.orig/tests/test_training_smoke.py	1970-01-01 00:00:00.000000000 +0000
++++ piano_amt-main/tests/test_training_smoke.py	2026-06-10 20:37:31.963422300 +0000
+@@ -0,0 +1,62 @@
++import torch
++import torch.nn as nn
++
++from piano_modeling.config import Config
++from piano_modeling.training import train_one_epoch, validate_quick
++
++
++class TinySystem(nn.Module):
++    def __init__(self, n_pitches: int):
++        super().__init__()
++        self.n_pitches = n_pitches
++        self.scale = nn.Parameter(torch.tensor(0.1))
++        self.bias = nn.Parameter(torch.zeros(()))
++
++    def forward(self, x, target_frames=None):
++        target_frames = target_frames or x.shape[-1]
++        base = x.mean(dim=1)
++        if base.shape[-1] != target_frames:
++            base = torch.nn.functional.interpolate(
++                base.unsqueeze(1), size=target_frames, mode="linear", align_corners=False
++            ).squeeze(1)
++        logits = self.scale * base.unsqueeze(-1).expand(-1, -1, self.n_pitches) + self.bias
++        return {
++            "onset": logits,
++            "offset": logits,
++            "frame": logits,
++            "velocity": logits,
++            "sustain": logits.mean(dim=-1),
++        }
++
++
++def _batch(batch_size=2, freq_bins=6, frames=8, pitches=4):
++    torch.manual_seed(0)
++    batch = {
++        "spec": torch.randn(batch_size, freq_bins, frames),
++        "onset": torch.zeros(batch_size, frames, pitches),
++        "offset": torch.zeros(batch_size, frames, pitches),
++        "frame": torch.zeros(batch_size, frames, pitches),
++        "velocity": torch.zeros(batch_size, frames, pitches),
++        "sustain": torch.zeros(batch_size, frames),
++    }
++    batch["onset"][:, 2, 1] = 1.0
++    batch["offset"][:, 5, 1] = 1.0
++    batch["frame"][:, 2:6, 1] = 1.0
++    batch["velocity"][:, 2, 1] = 0.75
++    batch["sustain"][:, 3:5] = 1.0
++    return batch
++
++
++def test_train_and_validate_smoke_on_synthetic_batch():
++    cfg = Config(midi_min=60, midi_max=63, use_amp=False, grad_clip=0.0)
++    system = TinySystem(cfg.n_pitches)
++    optimizer = torch.optim.SGD(system.parameters(), lr=1e-2)
++    loader = [_batch(pitches=cfg.n_pitches), _batch(pitches=cfg.n_pitches)]
++
++    train_stats = train_one_epoch(system, loader, optimizer, None, cfg, epoch=1, device="cpu")
++    val_stats = validate_quick(system, loader, cfg, device="cpu")
++
++    assert train_stats["total"] > 0
++    assert val_stats["total"] > 0
++    assert 0.0 <= val_stats["onset_f1"] <= 1.0
++    assert 0.0 <= val_stats["frame_f1"] <= 1.0

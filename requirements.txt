@@ -8,3 +8,5 @@ safetensors
 soundfile
 soxr
 scikit-learn
+tensorboard
+pytest

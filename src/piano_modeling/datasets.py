@@ -15,7 +15,6 @@ from torch.utils.data import DataLoader, Dataset
 from .audio import AudioAugmenter, load_audio_segment
 from .common import DEVICE
 from .config import CFG, Config
-from .midi_labels import midi_to_targets
 
 SPEC_LRU_CACHE_SIZE = 64
 
@@ -165,6 +164,8 @@ class MaestroCachedSpectrogramSegmentDataset(Dataset):
     def __getitem__(self, idx: int):
         row, full_spec, start_sec = self._choose_row_and_start(idx)
         spec = self._crop_spec(full_spec, start_sec)
+        from .midi_labels import midi_to_targets
+
         targets = midi_to_targets(row["midi_path"], start_sec, self.cfg.segment_seconds, self.cfg, self.cfg.label_frames)
         item = {
             "spec": spec,
@@ -228,6 +229,8 @@ class GenericAudioMidiSegmentDataset(Dataset):
         wav = load_audio_segment(row["audio_path"], start, self.cfg.segment_seconds, self.cfg.sample_rate)
         if self.augment is not None:
             wav = self.augment(wav)
+        from .midi_labels import midi_to_targets
+
         targets = midi_to_targets(row["midi_path"], start, self.cfg.segment_seconds, self.cfg, self.cfg.label_frames)
         item = {"audio": wav, "audio_path": row["audio_path"], "midi_path": row["midi_path"], "start_sec": torch.tensor(start, dtype=torch.float32)}
         for k, v in targets.items():

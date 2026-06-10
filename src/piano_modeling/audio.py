@@ -7,9 +7,19 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 
 from .config import Config
+
+
+def _require_torchaudio():
+    try:
+        import torchaudio
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "Audio resampling/EQ augmentation requires a working torchaudio install. "
+            "Install the torch/torchaudio build that matches your platform."
+        ) from exc
+    return torchaudio
 
 
 def load_audio_segment(path: str, start_sec: float, duration_sec: float, target_sr: int) -> torch.Tensor:
@@ -27,6 +37,7 @@ def load_audio_segment(path: str, start_sec: float, duration_sec: float, target_
         audio = audio[:, 0]
     wav = torch.from_numpy(audio)
     if native_sr != target_sr and wav.numel() > 0:
+        torchaudio = _require_torchaudio()
         wav = torchaudio.functional.resample(wav, native_sr, target_sr)
     target_len = int(round(duration_sec * target_sr))
     if wav.numel() < target_len:
@@ -77,9 +88,11 @@ class AudioAugmenter:
         if random.random() < cfg.eq_probability:
             if random.random() < 0.5:
                 cutoff = random.uniform(40, 180)
+                torchaudio = _require_torchaudio()
                 x = torchaudio.functional.highpass_biquad(x, cfg.sample_rate, cutoff)
             else:
                 cutoff = random.uniform(4500, 7800)
+                torchaudio = _require_torchaudio()
                 x = torchaudio.functional.lowpass_biquad(x, cfg.sample_rate, cutoff)
 
         return x.clamp(-1.0, 1.0)
