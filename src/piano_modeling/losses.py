@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import Config
+from .tokenization import EOS, FRAME_FORWARD, NOTE_ON_BASE, PAD, PEDAL_OFF, PEDAL_ON, token_spec_from_config
 
 
 def move_batch_to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
@@ -21,7 +22,52 @@ def bce_logits(logits: torch.Tensor, target: torch.Tensor, pos_weight: float) ->
     return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
 
 
+def _token_weights(target: torch.Tensor, cfg: Config) -> torch.Tensor:
+    spec = token_spec_from_config(cfg)
+    w = torch.ones_like(target, dtype=torch.float32)
+    w = torch.where(target == FRAME_FORWARD, w * float(cfg.token_frame_forward_weight), w)
+    pedal = (target == PEDAL_ON) | (target == PEDAL_OFF)
+    w = torch.where(pedal, w * float(cfg.token_pedal_weight), w)
+    w = torch.where(target == EOS, w * float(cfg.token_eos_weight), w)
+    w = torch.where(target == PAD, torch.zeros_like(w), w)
+    valid_vocab = (target >= 0) & (target < spec.vocab_size)
+    w = torch.where(valid_vocab, w, torch.zeros_like(w))
+    return w.to(target.device)
+
+
+def compute_token_loss(pred: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cfg: Config):
+    logits = pred["token_logits"]
+    tokens = batch["tokens"].long()
+    target = tokens[:, 1:].contiguous()
+    logits = logits[:, : target.shape[1], :].contiguous()
+    per_token = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        target.reshape(-1),
+        ignore_index=PAD,
+        reduction="none",
+        label_smoothing=float(getattr(cfg, "token_label_smoothing", 0.0)),
+    ).reshape_as(target)
+    weights = _token_weights(target, cfg).to(per_token.dtype)
+    total = (per_token * weights).sum() / weights.sum().clamp_min(1.0)
+    with torch.no_grad():
+        valid = target != PAD
+        pred_token = logits.argmax(dim=-1)
+        acc = ((pred_token == target) & valid).sum().float() / valid.sum().clamp_min(1)
+        non_frame = valid & (target != FRAME_FORWARD)
+        non_frame_acc = ((pred_token == target) & non_frame).sum().float() / non_frame.sum().clamp_min(1)
+    losses = {
+        "total": total,
+        "token_ce": total,
+        "token_accuracy": acc,
+        "token_non_frame_accuracy": non_frame_acc,
+    }
+    return total, {k: float(v.detach().cpu()) for k, v in losses.items()}
+
+
 def compute_loss(pred: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], cfg: Config):
+    if "token_logits" in pred or "tokens" in batch:
+        return compute_token_loss(pred, batch, cfg)
+
     losses = {}
     losses["onset"] = bce_logits(pred["onset"], batch["onset"], cfg.onset_pos_weight) * cfg.onset_loss_weight
     losses["offset"] = bce_logits(pred["offset"], batch["offset"], cfg.offset_pos_weight) * cfg.offset_loss_weight

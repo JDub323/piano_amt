@@ -14,9 +14,42 @@ from tqdm.auto import tqdm
 
 from .config import CFG, Config
 from .midi_labels import midi_to_targets
+from .tokenization import midi_to_event_tokens, token_vocab_size
 from .paths import ProjectPaths
 
 SPLITS = ("train", "validation", "test")
+
+
+def normalized_training_data_format(cfg: Config) -> str:
+    fmt = str(getattr(cfg, "training_data_format", "framewise")).lower()
+    if fmt in ("framewise", "dense", "pianoroll"):
+        return "framewise"
+    if fmt in ("tokenwise", "tokens", "seq2seq"):
+        return "tokenwise"
+    raise ValueError("cfg.training_data_format must be 'framewise' or 'tokenwise'")
+
+
+def active_sliced_zip_path(paths: ProjectPaths, cfg: Config) -> Path:
+    fmt = normalized_training_data_format(cfg)
+    if fmt == "framewise":
+        return Path(paths.sliced_zip_path)
+    return Path(paths.sliced_zip_path).with_name(Path(paths.sliced_zip_path).stem + "_tokenwise.zip")
+
+
+def other_sliced_zip_path(paths: ProjectPaths, cfg: Config) -> Path:
+    fmt = normalized_training_data_format(cfg)
+    if fmt == "framewise":
+        return Path(paths.sliced_zip_path).with_name(Path(paths.sliced_zip_path).stem + "_tokenwise.zip")
+    return Path(paths.sliced_zip_path)
+
+
+def delete_other_training_data(paths: ProjectPaths, cfg: Config) -> None:
+    if not getattr(cfg, "delete_other_training_data_on_rebuild", True):
+        return
+    other_zip = other_sliced_zip_path(paths, cfg)
+    if other_zip.exists():
+        other_zip.unlink()
+        print(f"Deleted other training-data zip to enforce one cache format: {other_zip}")
 
 
 def has_sliced_files(root: Path) -> bool:
@@ -34,11 +67,15 @@ def find_dataset_root_after_extract(tmp_root: Path) -> Path:
 
 def restore_sliced_dataset_from_zip(
     paths: ProjectPaths,
+    cfg: Config = CFG,
     force_resplice_sliced_cache: bool = False,
     tmp_root: str | Path = "/content/_maestro_sliced_extract_tmp",
 ) -> Path:
     """Restore the Drive-backed sliced zip to local disk for fast training."""
-    zip_path = Path(paths.sliced_zip_path)
+    if isinstance(cfg, bool):  # Backwards compatibility for restore_sliced_dataset_from_zip(paths, True).
+        force_resplice_sliced_cache = bool(cfg)
+        cfg = CFG
+    zip_path = active_sliced_zip_path(paths, cfg)
     dst_root = Path(paths.sliced_root)
     if not zip_path.exists():
         raise FileNotFoundError(
@@ -149,7 +186,8 @@ def metadata_value_matches(saved_value, current_value) -> bool:
 
 
 def validate_sliced_cache_compatibility(sliced_df: pd.DataFrame, cfg: Config, samples_per_split: int = 3) -> None:
-    required = {"spec", "onset", "offset", "frame", "velocity", "sustain"}
+    label_format = normalized_training_data_format(cfg)
+    required = {"spec", "tokens"} if label_format == "tokenwise" else {"spec", "onset", "offset", "frame", "velocity", "sustain"}
     expected_meta = {
         "feature_type": cfg.feature_type.lower(),
         "sample_rate": cfg.sample_rate,
@@ -161,6 +199,8 @@ def validate_sliced_cache_compatibility(sliced_df: pd.DataFrame, cfg: Config, sa
         "segment_seconds": cfg.segment_seconds,
         "midi_min": cfg.midi_min,
         "midi_max": cfg.midi_max,
+        "training_data_format": label_format,
+        "token_velocity_bins": cfg.token_velocity_bins,
     }
 
     sample_rows = []
@@ -191,16 +231,25 @@ def validate_sliced_cache_compatibility(sliced_df: pd.DataFrame, cfg: Config, sa
         if int(spec.shape[-1]) != int(cfg.label_frames):
             raise ValueError(f"{path}: frame count mismatch. chunk={spec.shape[-1]}, cfg.label_frames={cfg.label_frames}")
 
-        expected_pitch_label_shape = (cfg.label_frames, cfg.n_pitches)
-        for key in ["onset", "offset", "frame", "velocity"]:
-            actual = tuple(payload[key].shape)
-            if actual != expected_pitch_label_shape:
-                raise ValueError(f"{path}: {key} shape mismatch. chunk={actual}, expected={expected_pitch_label_shape}")
+        if label_format == "tokenwise":
+            tokens = payload["tokens"]
+            if tokens.ndim != 1:
+                raise ValueError(f"{path}: expected tokens shape [seq], got {tuple(tokens.shape)}")
+            if int(tokens.numel()) < 2:
+                raise ValueError(f"{path}: token sequence is too short")
+            if int(tokens.max().item()) >= token_vocab_size(cfg):
+                raise ValueError(f"{path}: token id exceeds cfg token vocab size")
+        else:
+            expected_pitch_label_shape = (cfg.label_frames, cfg.n_pitches)
+            for key in ["onset", "offset", "frame", "velocity"]:
+                actual = tuple(payload[key].shape)
+                if actual != expected_pitch_label_shape:
+                    raise ValueError(f"{path}: {key} shape mismatch. chunk={actual}, expected={expected_pitch_label_shape}")
 
-        sustain_shape = tuple(payload["sustain"].shape)
-        valid_sustain_shapes = {(cfg.label_frames,), (cfg.label_frames, 1)}
-        if sustain_shape not in valid_sustain_shapes:
-            raise ValueError(f"{path}: sustain shape mismatch. chunk={sustain_shape}, expected one of {sorted(valid_sustain_shapes)}")
+            sustain_shape = tuple(payload["sustain"].shape)
+            valid_sustain_shapes = {(cfg.label_frames,), (cfg.label_frames, 1)}
+            if sustain_shape not in valid_sustain_shapes:
+                raise ValueError(f"{path}: sustain shape mismatch. chunk={sustain_shape}, expected one of {sorted(valid_sustain_shapes)}")
 
         metadata = payload.get("metadata")
         if metadata is None:
@@ -245,8 +294,9 @@ def pre_slice_dataset(
     force_resplice_sliced_cache: bool = False,
 ) -> pd.DataFrame:
     rows = []
+    label_format = normalized_training_data_format(cfg)
     df_to_process = meta_df if max_songs is None else meta_df.head(max_songs)
-    print(f"Pre-slicing {len(df_to_process)} songs into {cfg.segment_seconds:g}s chunks...")
+    print(f"Pre-slicing {len(df_to_process)} songs into {cfg.segment_seconds:g}s {label_format} chunks...")
 
     for idx, row in tqdm(df_to_process.iterrows(), total=len(df_to_process)):
         spec_path = Path(row["spec_path"])
@@ -276,27 +326,33 @@ def pre_slice_dataset(
                     crop = torch.nn.functional.pad(crop, (0, n_frames - crop.shape[-1]))
                 elif crop.shape[-1] > n_frames:
                     crop = crop[:, :n_frames]
-                targets = midi_to_targets(midi_path, start_sec, cfg.segment_seconds, cfg, n_frames)
-                save_dict = {
-                    "spec": crop.half(),
-                    "onset": torch.from_numpy(targets["onset"]).half(),
-                    "offset": torch.from_numpy(targets["offset"]).half(),
-                    "frame": torch.from_numpy(targets["frame"]).half(),
-                    "velocity": torch.from_numpy(targets["velocity"]).half(),
-                    "sustain": torch.from_numpy(targets["sustain"]).half(),
-                    "metadata": {
-                        "feature_type": cfg.feature_type.lower(),
-                        "sample_rate": cfg.sample_rate,
-                        "hop_length": cfg.hop_length,
-                        "n_fft": cfg.n_fft,
-                        "n_mels": cfg.n_mels,
-                        "f_min": cfg.f_min,
-                        "f_max": cfg.f_max,
-                        "segment_seconds": cfg.segment_seconds,
-                        "midi_min": cfg.midi_min,
-                        "midi_max": cfg.midi_max,
-                    },
+                metadata = {
+                    "feature_type": cfg.feature_type.lower(),
+                    "sample_rate": cfg.sample_rate,
+                    "hop_length": cfg.hop_length,
+                    "n_fft": cfg.n_fft,
+                    "n_mels": cfg.n_mels,
+                    "f_min": cfg.f_min,
+                    "f_max": cfg.f_max,
+                    "segment_seconds": cfg.segment_seconds,
+                    "midi_min": cfg.midi_min,
+                    "midi_max": cfg.midi_max,
+                    "training_data_format": label_format,
+                    "token_velocity_bins": cfg.token_velocity_bins,
                 }
+                save_dict = {"spec": crop.half(), "metadata": metadata}
+                if label_format == "tokenwise":
+                    tokens = midi_to_event_tokens(midi_path, start_sec, cfg.segment_seconds, cfg, max_seq_len=cfg.token_max_seq_len)
+                    save_dict["tokens"] = torch.from_numpy(tokens).to(torch.int32)
+                else:
+                    targets = midi_to_targets(midi_path, start_sec, cfg.segment_seconds, cfg, n_frames)
+                    save_dict.update({
+                        "onset": torch.from_numpy(targets["onset"]).half(),
+                        "offset": torch.from_numpy(targets["offset"]).half(),
+                        "frame": torch.from_numpy(targets["frame"]).half(),
+                        "velocity": torch.from_numpy(targets["velocity"]).half(),
+                        "sustain": torch.from_numpy(targets["sustain"]).half(),
+                    })
                 chunk_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(save_dict, chunk_path)
         except Exception as e:
@@ -309,18 +365,20 @@ def pre_slice_dataset(
     return sliced_df
 
 
-def backup_sliced_dataset_to_drive(paths: ProjectPaths) -> None:
+def backup_sliced_dataset_to_drive(paths: ProjectPaths, cfg: Config = CFG) -> None:
     if not has_sliced_files(paths.sliced_root):
         raise FileNotFoundError(f"No sliced files to back up under {paths.sliced_root}")
-    local_zip_base = Path("/content/local_maestro_sliced")
+    local_zip_base = Path(f"/content/local_maestro_sliced_{normalized_training_data_format(cfg)}")
     local_zip = local_zip_base.with_suffix(".zip")
     if local_zip.exists():
         local_zip.unlink()
     print("Compressing local sliced dataset. This can take a few minutes...")
     shutil.make_archive(str(local_zip_base), "zip", root_dir=str(paths.sliced_root.parent), base_dir=paths.sliced_root.name)
-    paths.sliced_zip_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Copying sliced backup to Drive: {paths.sliced_zip_path}")
-    shutil.copy(local_zip, paths.sliced_zip_path)
+    zip_path = active_sliced_zip_path(paths, cfg)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Copying sliced backup to Drive: {zip_path}")
+    shutil.copy(local_zip, zip_path)
+    delete_other_training_data(paths, cfg)
     print("Backup complete.")
 
 
@@ -346,12 +404,13 @@ def load_or_build_sliced_dataset(
                 "Restore the sliced zip, or rebuild the full-song cache first."
             )
         sliced_df = pre_slice_dataset(meta_df, cfg, paths, max_songs=None, force_resplice_sliced_cache=True)
-        backup_sliced_dataset_to_drive(paths)
+        backup_sliced_dataset_to_drive(paths, cfg)
         return sliced_df
 
     if not has_sliced_files(paths.sliced_root):
-        if paths.sliced_zip_path.exists():
-            restore_sliced_dataset_from_zip(paths, force_resplice_sliced_cache=False)
+        zip_path = active_sliced_zip_path(paths, cfg)
+        if zip_path.exists():
+            restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=False)
         elif allow_rebuild_if_sliced_zip_missing:
             print("Sliced zip is missing, but rebuild is explicitly allowed.")
             if meta_df is None or not full_song_cache_complete(meta_df):
@@ -361,11 +420,11 @@ def load_or_build_sliced_dataset(
                 )
             paths.sliced_root.mkdir(parents=True, exist_ok=True)
             sliced_df = pre_slice_dataset(meta_df, cfg, paths, max_songs=None)
-            backup_sliced_dataset_to_drive(paths)
+            backup_sliced_dataset_to_drive(paths, cfg)
             return sliced_df
         else:
             raise FileNotFoundError(
-                f"Missing local sliced dataset and Drive zip:\n  local: {paths.sliced_root}\n  zip:   {paths.sliced_zip_path}\n"
+                f"Missing local sliced dataset and Drive zip:\n  local: {paths.sliced_root}\n  zip:   {active_sliced_zip_path(paths, cfg)}\n"
                 "Safe default is to stop rather than redownload/reslice. "
                 "Restore the zip to Drive or set allow_rebuild_if_sliced_zip_missing=True."
             )
@@ -378,7 +437,31 @@ def load_or_build_sliced_dataset(
         sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
 
     sliced_df = repair_manifest_paths(sliced_df, paths, cfg)
-    validate_sliced_cache_compatibility(sliced_df, cfg)
+    try:
+        validate_sliced_cache_compatibility(sliced_df, cfg)
+    except (KeyError, ValueError) as exc:
+        print(f"Existing local sliced cache is not compatible with cfg.training_data_format={normalized_training_data_format(cfg)!r}: {exc}")
+        zip_path = active_sliced_zip_path(paths, cfg)
+        if zip_path.exists():
+            print("Replacing local sliced cache with the active-format zip.")
+            restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=True)
+            sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
+            sliced_df = repair_manifest_paths(sliced_df, paths, cfg)
+            validate_sliced_cache_compatibility(sliced_df, cfg)
+        elif allow_rebuild_if_sliced_zip_missing:
+            if meta_df is None or not full_song_cache_complete(meta_df):
+                raise FileNotFoundError(
+                    "The local sliced cache has the wrong format and the active-format zip is missing. "
+                    "Cannot rebuild because the full-song spectrogram/MIDI cache is incomplete."
+                ) from exc
+            print("Deleting incompatible local sliced cache and rebuilding the active format.")
+            if paths.sliced_root.exists():
+                shutil.rmtree(paths.sliced_root)
+            paths.sliced_root.mkdir(parents=True, exist_ok=True)
+            sliced_df = pre_slice_dataset(meta_df, cfg, paths, max_songs=None, force_resplice_sliced_cache=True)
+            backup_sliced_dataset_to_drive(paths, cfg)
+        else:
+            raise
     print("Sliced chunk counts:")
     print(sliced_df["split"].value_counts())
     return sliced_df

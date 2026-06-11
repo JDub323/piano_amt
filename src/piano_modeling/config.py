@@ -27,11 +27,37 @@ class Config:
     pretrained: bool = True
     decoder_channels: int = 256
     decoder_type: str = "fpn"             # "fpn" uses encoder skip features; "legacy" uses deepest map only.
+    model_type: str = "framewise"         # "framewise" or experimental "token_seq2seq".
+    training_data_format: str = "framewise"  # "framewise" dense labels or "tokenwise" event-token labels.
     dropout: float = 0.10
     compile_model: bool = True
 
+    # Experimental token seq2seq model/cache
+    token_velocity_bins: int = 32
+    token_max_seq_len: int = 4096
+    token_encoder_dim: int = 256
+    token_encoder_layers: int = 4
+    token_decoder_layers: int = 4
+    token_num_heads: int = 8
+    token_ff_dim: int = 1024
+    token_dropout: float = 0.10
+    token_label_smoothing: float = 0.02
+    token_frame_forward_weight: float = 0.25
+    token_pedal_weight: float = 0.75
+    token_eos_weight: float = 1.0
+    delete_other_training_data_on_rebuild: bool = True
+
     # Training
-    FIND_OPTIMAL_SETTINGS: bool = False
+    FIND_OPTIMAL_SETTINGS: bool = False  # Legacy notebook flag; prefer the explicit flags below.
+    use_found_training_settings: bool = False
+    use_found_learning_rate: bool = False
+    found_training_settings_path: str = ""
+    found_learning_rate_path: str = ""
+    lr_finder_start_lr: float = 1e-7
+    lr_finder_end_lr: float = 1e-1
+    lr_finder_num_iters: int = 100
+    lr_finder_train_samples: int = 2048
+    lr_finder_smoothing: float = 0.05
     batch_size: int = 32
     num_workers: int = 2
     epochs: int = 40
@@ -39,6 +65,16 @@ class Config:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     use_amp: bool = True
+
+    # Profiler / flame-chart debugging
+    enable_flame_charts: bool = False
+    flame_chart_batches: int = 8
+    flame_chart_wait_batches: int = 1
+    flame_chart_warmup_batches: int = 1
+    flame_chart_output_dir: str = ""
+    flame_chart_record_shapes: bool = True
+    flame_chart_profile_memory: bool = True
+    flame_chart_with_stack: bool = True
 
     # Loss weights
     onset_loss_weight: float = 2.0

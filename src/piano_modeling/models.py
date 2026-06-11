@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .config import Config
 from .frontend import SpectrogramFrontend
+from .tokenization import BOS, EOS, PAD, token_vocab_size
 
 
 class ConvBNAct(nn.Module):
@@ -145,12 +146,118 @@ class ResNetPianoTranscriber(nn.Module):
         }
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim: int, max_len: int = 16384):
+        super().__init__()
+        position = torch.arange(max_len).float().unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-torch.log(torch.tensor(10000.0)) / dim))
+        pe = torch.zeros(max_len, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.shape[1]].to(dtype=x.dtype, device=x.device)
+
+
+class TokenSeq2SeqTranscriber(nn.Module):
+    """Experimental audio-to-MIDI-token seq2seq model.
+
+    The encoder keeps the spectrogram as input but replaces dense piano-roll heads with an
+    autoregressive Transformer decoder over compact MIDI-event tokens. Training uses teacher
+    forcing and token cross-entropy in losses.compute_token_loss.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        d = int(cfg.token_encoder_dim)
+        self.vocab_size = token_vocab_size(cfg)
+        self.spec_encoder = nn.Sequential(
+            ConvBNAct(3, d // 4, 3, 1, cfg.token_dropout),
+            nn.Conv2d(d // 4, d // 2, kernel_size=3, padding=1, stride=(2, 1), bias=False),
+            nn.BatchNorm2d(d // 2),
+            nn.SiLU(inplace=True),
+            ConvBNAct(d // 2, d, 3, 1, cfg.token_dropout),
+        )
+        self.input_proj = nn.Linear(d, d)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d,
+            nhead=int(cfg.token_num_heads),
+            dim_feedforward=int(cfg.token_ff_dim),
+            dropout=float(cfg.token_dropout),
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(cfg.token_encoder_layers))
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d,
+            nhead=int(cfg.token_num_heads),
+            dim_feedforward=int(cfg.token_ff_dim),
+            dropout=float(cfg.token_dropout),
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=int(cfg.token_decoder_layers))
+        self.token_embed = nn.Embedding(self.vocab_size, d, padding_idx=PAD)
+        self.audio_pos = SinusoidalPositionalEncoding(d, max_len=max(2048, cfg.label_frames + 16))
+        self.token_pos = SinusoidalPositionalEncoding(d, max_len=max(1024, cfg.token_max_seq_len + 16))
+        self.norm = nn.LayerNorm(d)
+        self.output = nn.Linear(d, self.vocab_size)
+
+    def encode(self, feat: torch.Tensor) -> torch.Tensor:
+        z = self.spec_encoder(feat)          # [B, C, F', T]
+        z = z.mean(dim=2).transpose(1, 2)    # [B, T, C]
+        z = self.input_proj(z)
+        z = self.audio_pos(z)
+        return self.encoder(z)
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+
+    def forward(self, feat: torch.Tensor, target_tokens: Optional[torch.Tensor] = None, **_) -> Dict[str, torch.Tensor]:
+        memory = self.encode(feat)
+        if target_tokens is None:
+            target_tokens = torch.full((feat.shape[0], 1), BOS, device=feat.device, dtype=torch.long)
+        target_tokens = target_tokens.long().clamp(min=0, max=self.vocab_size - 1)
+        tgt = self.token_pos(self.token_embed(target_tokens))
+        causal_mask = self._causal_mask(tgt.shape[1], tgt.device)
+        padding_mask = target_tokens.eq(PAD)
+        dec = self.decoder(tgt, memory, tgt_mask=causal_mask, tgt_key_padding_mask=padding_mask)
+        logits = self.output(self.norm(dec))
+        return {"token_logits": logits}
+
+    @torch.no_grad()
+    def generate(self, feat: torch.Tensor, max_len: Optional[int] = None) -> torch.Tensor:
+        self.eval()
+        max_len = int(max_len or self.cfg.token_max_seq_len)
+        memory = self.encode(feat)
+        tokens = torch.full((feat.shape[0], 1), BOS, device=feat.device, dtype=torch.long)
+        finished = torch.zeros(feat.shape[0], device=feat.device, dtype=torch.bool)
+        for _ in range(max_len - 1):
+            tgt = self.token_pos(self.token_embed(tokens))
+            dec = self.decoder(tgt, memory, tgt_mask=self._causal_mask(tgt.shape[1], tgt.device))
+            next_token = self.output(self.norm(dec[:, -1])).argmax(dim=-1)
+            next_token = torch.where(finished, torch.full_like(next_token, PAD), next_token)
+            tokens = torch.cat([tokens, next_token[:, None]], dim=1)
+            finished |= next_token.eq(EOS)
+            if bool(finished.all()):
+                break
+        return tokens
+
+
 class PianoTranscriptionSystem(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.frontend = SpectrogramFrontend(cfg)  # waveform path for offline/live inference
-        self.model = ResNetPianoTranscriber(cfg)
+        model_type = str(getattr(cfg, "model_type", "framewise")).lower()
+        if model_type in ("framewise", "resnet", "resnet_framewise"):
+            self.model = ResNetPianoTranscriber(cfg)
+        elif model_type in ("token_seq2seq", "seq2seq", "tokenwise"):
+            self.model = TokenSeq2SeqTranscriber(cfg)
+        else:
+            raise ValueError("cfg.model_type must be 'framewise' or 'token_seq2seq'")
 
     def _cached_spec_to_model_features(self, spec: torch.Tensor) -> torch.Tensor:
         # spec: [B, F, T] or [F, T], raw cached log spectrogram
@@ -166,12 +273,24 @@ class PianoTranscriptionSystem(nn.Module):
         feat = self.frontend.specaugment(feat)
         return feat
 
-    def forward(self, x: torch.Tensor, target_frames: Optional[int] = None):
+    def forward(self, x: torch.Tensor, target_frames: Optional[int] = None, target_tokens: Optional[torch.Tensor] = None):
         if x.ndim in (2, 3) and x.shape[-2] in (self.cfg.n_mels, self.cfg.cqt_n_bins):
             feat = self._cached_spec_to_model_features(x)
         else:
             feat = self.frontend(x)
+        if isinstance(self.model, TokenSeq2SeqTranscriber):
+            return self.model(feat, target_tokens=target_tokens)
         return self.model(feat, target_frames=target_frames)
+
+    @torch.no_grad()
+    def generate_tokens(self, x: torch.Tensor, max_len: Optional[int] = None) -> torch.Tensor:
+        if x.ndim in (2, 3) and x.shape[-2] in (self.cfg.n_mels, self.cfg.cqt_n_bins):
+            feat = self._cached_spec_to_model_features(x)
+        else:
+            feat = self.frontend(x)
+        if not isinstance(self.model, TokenSeq2SeqTranscriber):
+            raise TypeError("generate_tokens is only available for cfg.model_type='token_seq2seq'")
+        return self.model.generate(feat, max_len=max_len)
 
 
 def count_parameters_millions(model: nn.Module) -> float:

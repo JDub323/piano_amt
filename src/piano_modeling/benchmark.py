@@ -208,3 +208,29 @@ def apply_best_benchmark_config(cfg: Config, bench_df: pd.DataFrame, memory_soft
     print("cfg.use_amp =", cfg.use_amp)
     print(best)
     return cfg
+
+
+def save_best_benchmark_config(path, bench_df: pd.DataFrame, memory_soft_limit_gb: float = 14.0) -> dict:
+    """Persist the same training-speed choices that apply_best_benchmark_config would use."""
+    import json
+    from pathlib import Path
+
+    temp_cfg = copy.deepcopy(CFG)
+    chosen_cfg = apply_best_benchmark_config(temp_cfg, bench_df.copy(), memory_soft_limit_gb=memory_soft_limit_gb)
+    ok = bench_df[bench_df["status"] == "ok"].copy() if "status" in bench_df.columns else bench_df.copy()
+    max_speed = ok["chunks_per_sec"].max() if "chunks_per_sec" in ok.columns and len(ok) else None
+    best_row = ok.sort_values("chunks_per_sec", ascending=False).iloc[0].to_dict() if "chunks_per_sec" in ok.columns and len(ok) else {}
+    payload = {
+        "best": {
+            "batch_size": int(chosen_cfg.batch_size),
+            "num_workers": int(chosen_cfg.num_workers),
+            "use_amp": bool(chosen_cfg.use_amp),
+        },
+        "fastest_row": best_row,
+        "max_chunks_per_sec": float(max_speed) if max_speed is not None else None,
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, default=str))
+    print(f"Saved found training-speed settings to {path}")
+    return payload

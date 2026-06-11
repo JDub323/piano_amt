@@ -18,6 +18,7 @@ _LAZY_EXPORTS = {
     "train_one_epoch": (".training", "train_one_epoch"),
     "validate_quick": (".training", "validate_quick"),
     "find_optimal_lr_fastai": (".lr_finder", "find_optimal_lr_fastai"),
+    "find_learning_rate_range_test": (".lr_finder", "find_learning_rate_range_test"),
 }
 
 

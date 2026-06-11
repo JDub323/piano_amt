@@ -10,11 +10,14 @@ import pandas as pd
 import soundfile as sf
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data._utils.collate import default_collate
 
 from .audio import AudioAugmenter, load_audio_segment
 from .common import DEVICE
 from .config import CFG, Config
+from .tokenization import PAD
 
 SPEC_LRU_CACHE_SIZE = 64
 
@@ -50,13 +53,29 @@ class PreSlicedMaestroDataset(Dataset):
             row_idx = idx % len(self.df)
         row = self.df.iloc[row_idx]
         payload = torch.load(row["chunk_path"], map_location="cpu")
-        item = {}
-        for k in ["spec", "onset", "offset", "frame", "velocity", "sustain"]:
-            item[k] = payload[k].float()
-        if item["sustain"].ndim == 2 and item["sustain"].shape[-1] == 1:
-            item["sustain"] = item["sustain"].squeeze(-1)
+        item = {"spec": payload["spec"].float()}
+        if "tokens" in payload:
+            item["tokens"] = payload["tokens"].long()
+            item["token_length"] = torch.tensor(int(item["tokens"].numel()), dtype=torch.long)
+        else:
+            for k in ["onset", "offset", "frame", "velocity", "sustain"]:
+                item[k] = payload[k].float()
+            if item["sustain"].ndim == 2 and item["sustain"].shape[-1] == 1:
+                item["sustain"] = item["sustain"].squeeze(-1)
         item["start_sec"] = torch.tensor(float(row.get("start_sec", 0.0)), dtype=torch.float32)
         return item
+
+
+def piano_collate(batch):
+    if batch and "tokens" in batch[0]:
+        out = {}
+        out["spec"] = default_collate([b["spec"] for b in batch])
+        out["tokens"] = pad_sequence([b["tokens"].long() for b in batch], batch_first=True, padding_value=PAD)
+        out["token_length"] = torch.tensor([int(b["tokens"].numel()) for b in batch], dtype=torch.long)
+        if "start_sec" in batch[0]:
+            out["start_sec"] = default_collate([b["start_sec"] for b in batch])
+        return out
+    return default_collate(batch)
 
 
 def _none_if_zero(value):
@@ -82,6 +101,7 @@ def make_sliced_loaders(
         num_workers=cfg.num_workers,
         pin_memory=(device == "cuda"),
         persistent_workers=(cfg.num_workers > 0),
+        collate_fn=piano_collate,
     )
     train_loader = DataLoader(
         train_ds,
