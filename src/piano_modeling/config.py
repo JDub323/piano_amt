@@ -47,6 +47,13 @@ class Config:
     token_eos_weight: float = 1.0
     delete_other_training_data_on_rebuild: bool = True
 
+    # Sliced-cache backup/restore
+    use_sharded_sliced_backups: bool = True
+    sliced_backup_num_shards: int = 4
+    sliced_backup_compression: str = "deflated"  # "deflated" or "stored"; stored is faster but larger.
+    sliced_backup_compresslevel: int = 1           # Low deflate level saves time on Colab.
+    resume_sharded_sliced_backup: bool = True      # Reuse completed shard zips after Colab interruption.
+
     # Training
     FIND_OPTIMAL_SETTINGS: bool = False  # Legacy notebook flag; prefer the explicit flags below.
     use_found_training_settings: bool = False

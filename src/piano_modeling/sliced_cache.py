@@ -43,13 +43,76 @@ def other_sliced_zip_path(paths: ProjectPaths, cfg: Config) -> Path:
     return Path(paths.sliced_zip_path)
 
 
+def sliced_zip_shard_glob(zip_path: Path) -> str:
+    zip_path = Path(zip_path)
+    return f"{zip_path.stem}_part*-of*.zip"
+
+
+def planned_sliced_zip_shard_paths(zip_path: Path, num_shards: int) -> list[Path]:
+    zip_path = Path(zip_path)
+    num_shards = max(1, int(num_shards))
+    width = max(3, len(str(num_shards)))
+    return [
+        zip_path.with_name(f"{zip_path.stem}_part{i:0{width}d}-of{num_shards:0{width}d}.zip")
+        for i in range(1, num_shards + 1)
+    ]
+
+
+def existing_sliced_zip_shards(zip_path: Path) -> list[Path]:
+    zip_path = Path(zip_path)
+    return sorted(zip_path.parent.glob(sliced_zip_shard_glob(zip_path)))
+
+
+def complete_sliced_zip_shards(zip_path: Path) -> list[Path]:
+    zip_path = Path(zip_path)
+    pattern = re.compile(rf"^{re.escape(zip_path.stem)}_part(\d+)-of(\d+)\.zip$")
+    parsed = []
+    for shard in existing_sliced_zip_shards(zip_path):
+        match = pattern.match(shard.name)
+        if match:
+            parsed.append((int(match.group(1)), int(match.group(2)), shard))
+    if not parsed:
+        return []
+    totals = {total for _, total, _ in parsed}
+    if len(totals) != 1:
+        return []
+    total = totals.pop()
+    by_index = {idx: shard for idx, _, shard in parsed}
+    if set(by_index) != set(range(1, total + 1)):
+        return []
+    return [by_index[i] for i in range(1, total + 1)]
+
+
+def active_sliced_backup_sources(paths: ProjectPaths, cfg: Config) -> list[Path]:
+    zip_path = active_sliced_zip_path(paths, cfg)
+    shards = complete_sliced_zip_shards(zip_path)
+    prefer_shards = bool(getattr(cfg, "use_sharded_sliced_backups", True))
+    if prefer_shards and shards:
+        return shards
+    if zip_path.exists():
+        return [zip_path]
+    if shards:
+        return shards
+    return []
+
+
+def active_sliced_backup_exists(paths: ProjectPaths, cfg: Config) -> bool:
+    return bool(active_sliced_backup_sources(paths, cfg))
+
+
 def delete_other_training_data(paths: ProjectPaths, cfg: Config) -> None:
     if not getattr(cfg, "delete_other_training_data_on_rebuild", True):
         return
     other_zip = other_sliced_zip_path(paths, cfg)
-    if other_zip.exists():
-        other_zip.unlink()
-        print(f"Deleted other training-data zip to enforce one cache format: {other_zip}")
+    deleted = []
+    for candidate in [other_zip] + existing_sliced_zip_shards(other_zip):
+        if candidate.exists():
+            candidate.unlink()
+            deleted.append(candidate)
+    if deleted:
+        print("Deleted other training-data backups to enforce one cache format:")
+        for path in deleted:
+            print(f"  {path}")
 
 
 def has_sliced_files(root: Path) -> bool:
@@ -76,10 +139,15 @@ def restore_sliced_dataset_from_zip(
         force_resplice_sliced_cache = bool(cfg)
         cfg = CFG
     zip_path = active_sliced_zip_path(paths, cfg)
+    backup_sources = active_sliced_backup_sources(paths, cfg)
     dst_root = Path(paths.sliced_root)
-    if not zip_path.exists():
+    if not backup_sources:
+        partial_shards = existing_sliced_zip_shards(zip_path)
+        partial_msg = ""
+        if partial_shards:
+            partial_msg = "\nFound incomplete sliced dataset shard set:\n" + "\n".join(f"  {p}" for p in partial_shards)
         raise FileNotFoundError(
-            f"Missing sliced dataset zip: {zip_path}\n"
+            f"Missing complete sliced dataset backup for: {zip_path}{partial_msg}\n"
             "Safe default is to stop here so you do not accidentally redo expensive work. "
             "If you intentionally want to rebuild from the full-song cache, pass "
             "allow_rebuild_if_sliced_zip_missing=True to load_or_build_sliced_dataset()."
@@ -88,13 +156,19 @@ def restore_sliced_dataset_from_zip(
         print(f"Found existing local sliced dataset at {dst_root}; not restoring again.")
         return dst_root
 
-    print(f"Restoring pre-sliced dataset from Drive zip:\n  {zip_path}\n-> {dst_root}")
+    if len(backup_sources) == 1:
+        print(f"Restoring pre-sliced dataset from Drive zip:\n  {backup_sources[0]}\n-> {dst_root}")
+    else:
+        print(f"Restoring pre-sliced dataset from {len(backup_sources)} Drive zip shards -> {dst_root}")
+        for shard in backup_sources:
+            print(f"  {shard}")
     tmp_root = Path(tmp_root)
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
     tmp_root.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(tmp_root)
+    for source in backup_sources:
+        with zipfile.ZipFile(source, "r") as zf:
+            zf.extractall(tmp_root)
     extracted_root = find_dataset_root_after_extract(tmp_root)
     if dst_root.exists():
         shutil.rmtree(dst_root)
@@ -365,7 +439,89 @@ def pre_slice_dataset(
     return sliced_df
 
 
+def zip_compression_kwargs(cfg: Config) -> dict:
+    mode = str(getattr(cfg, "sliced_backup_compression", "deflated")).lower()
+    if mode in ("store", "stored", "none", "zip_stored"):
+        return {"compression": zipfile.ZIP_STORED}
+    if mode in ("deflate", "deflated", "zip_deflated"):
+        level = int(getattr(cfg, "sliced_backup_compresslevel", 1))
+        level = max(0, min(9, level))
+        return {"compression": zipfile.ZIP_DEFLATED, "compresslevel": level}
+    raise ValueError("cfg.sliced_backup_compression must be 'deflated' or 'stored'")
+
+
+def write_zip_from_files(zip_path: Path, root: Path, files: list[Path], cfg: Config) -> None:
+    root = Path(root)
+    zip_path = Path(zip_path)
+    kwargs = zip_compression_kwargs(cfg)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", **kwargs) as zf:
+        for file_path in tqdm(files, desc=f"Writing {zip_path.name}"):
+            zf.write(file_path, arcname=str(file_path.relative_to(root.parent)))
+
+
+def split_files_for_zip_shards(files: list[Path], num_shards: int) -> list[list[Path]]:
+    num_shards = max(1, int(num_shards))
+    buckets: list[list[Path]] = [[] for _ in range(num_shards)]
+    sizes = [0] * num_shards
+    for file_path in sorted(files, key=lambda p: p.stat().st_size, reverse=True):
+        bucket_idx = min(range(num_shards), key=lambda i: sizes[i])
+        buckets[bucket_idx].append(file_path)
+        sizes[bucket_idx] += file_path.stat().st_size
+    return [sorted(bucket) for bucket in buckets]
+
+
+def backup_sliced_dataset_to_drive_sharded(paths: ProjectPaths, cfg: Config = CFG) -> None:
+    if not has_sliced_files(paths.sliced_root):
+        raise FileNotFoundError(f"No sliced files to back up under {paths.sliced_root}")
+    zip_path = active_sliced_zip_path(paths, cfg)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    num_shards = max(1, int(getattr(cfg, "sliced_backup_num_shards", 4)))
+    target_shards = planned_sliced_zip_shard_paths(zip_path, num_shards)
+    local_shards = planned_sliced_zip_shard_paths(
+        Path(f"/content/local_maestro_sliced_{normalized_training_data_format(cfg)}.zip"),
+        num_shards,
+    )
+    files = sorted(p for p in Path(paths.sliced_root).rglob("*") if p.is_file())
+    if not files:
+        raise FileNotFoundError(f"No files to back up under {paths.sliced_root}")
+    buckets = split_files_for_zip_shards(files, num_shards)
+    resume = bool(getattr(cfg, "resume_sharded_sliced_backup", True))
+    print(
+        f"Compressing local sliced dataset into {num_shards} zip shards. "
+        "Each shard is copied to Drive as soon as it finishes."
+    )
+    for idx, (bucket, local_shard, target_shard) in enumerate(zip(buckets, local_shards, target_shards), start=1):
+        if target_shard.exists() and resume:
+            print(f"Shard {idx}/{num_shards} already exists on Drive; skipping: {target_shard}")
+            continue
+        if local_shard.exists():
+            local_shard.unlink()
+        if target_shard.exists():
+            target_shard.unlink()
+        total_mb = sum(p.stat().st_size for p in bucket) / (1024 * 1024)
+        print(f"Creating shard {idx}/{num_shards}: {len(bucket)} files, {total_mb:.1f} MiB before compression")
+        write_zip_from_files(local_shard, Path(paths.sliced_root), bucket, cfg)
+        print(f"Copying shard {idx}/{num_shards} to Drive: {target_shard}")
+        shutil.copy(local_shard, target_shard)
+
+    complete = complete_sliced_zip_shards(zip_path)
+    if len(complete) != num_shards:
+        raise RuntimeError(
+            f"Sharded backup is incomplete: found {len(complete)}/{num_shards} complete shards for {zip_path}. "
+            "Completed shards remain on Drive; rerun backup_sliced_dataset_to_drive() to resume."
+        )
+    if zip_path.exists():
+        zip_path.unlink()
+        print(f"Deleted superseded monolithic sliced backup: {zip_path}")
+    delete_other_training_data(paths, cfg)
+    print("Sharded backup complete.")
+
+
 def backup_sliced_dataset_to_drive(paths: ProjectPaths, cfg: Config = CFG) -> None:
+    if bool(getattr(cfg, "use_sharded_sliced_backups", True)):
+        backup_sliced_dataset_to_drive_sharded(paths, cfg)
+        return
     if not has_sliced_files(paths.sliced_root):
         raise FileNotFoundError(f"No sliced files to back up under {paths.sliced_root}")
     local_zip_base = Path(f"/content/local_maestro_sliced_{normalized_training_data_format(cfg)}")
@@ -378,6 +534,9 @@ def backup_sliced_dataset_to_drive(paths: ProjectPaths, cfg: Config = CFG) -> No
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Copying sliced backup to Drive: {zip_path}")
     shutil.copy(local_zip, zip_path)
+    for shard in existing_sliced_zip_shards(zip_path):
+        shard.unlink()
+        print(f"Deleted superseded sliced backup shard: {shard}")
     delete_other_training_data(paths, cfg)
     print("Backup complete.")
 
@@ -409,10 +568,10 @@ def load_or_build_sliced_dataset(
 
     if not has_sliced_files(paths.sliced_root):
         zip_path = active_sliced_zip_path(paths, cfg)
-        if zip_path.exists():
+        if active_sliced_backup_exists(paths, cfg):
             restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=False)
         elif allow_rebuild_if_sliced_zip_missing:
-            print("Sliced zip is missing, but rebuild is explicitly allowed.")
+            print("Sliced backup is missing, but rebuild is explicitly allowed.")
             if meta_df is None or not full_song_cache_complete(meta_df):
                 raise FileNotFoundError(
                     "Cannot rebuild sliced cache because full-song spec/MIDI cache is incomplete. "
@@ -424,9 +583,9 @@ def load_or_build_sliced_dataset(
             return sliced_df
         else:
             raise FileNotFoundError(
-                f"Missing local sliced dataset and Drive zip:\n  local: {paths.sliced_root}\n  zip:   {active_sliced_zip_path(paths, cfg)}\n"
+                f"Missing local sliced dataset and complete Drive backup:\n  local: {paths.sliced_root}\n  base:  {active_sliced_zip_path(paths, cfg)}\n"
                 "Safe default is to stop rather than redownload/reslice. "
-                "Restore the zip to Drive or set allow_rebuild_if_sliced_zip_missing=True."
+                "Restore the zip/shards to Drive or set allow_rebuild_if_sliced_zip_missing=True."
             )
 
     if paths.sliced_manifest.exists():
@@ -442,8 +601,8 @@ def load_or_build_sliced_dataset(
     except (KeyError, ValueError) as exc:
         print(f"Existing local sliced cache is not compatible with cfg.training_data_format={normalized_training_data_format(cfg)!r}: {exc}")
         zip_path = active_sliced_zip_path(paths, cfg)
-        if zip_path.exists():
-            print("Replacing local sliced cache with the active-format zip.")
+        if active_sliced_backup_exists(paths, cfg):
+            print("Replacing local sliced cache with the active-format backup.")
             restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=True)
             sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
             sliced_df = repair_manifest_paths(sliced_df, paths, cfg)
@@ -451,7 +610,7 @@ def load_or_build_sliced_dataset(
         elif allow_rebuild_if_sliced_zip_missing:
             if meta_df is None or not full_song_cache_complete(meta_df):
                 raise FileNotFoundError(
-                    "The local sliced cache has the wrong format and the active-format zip is missing. "
+                    "The local sliced cache has the wrong format and the active-format backup is missing. "
                     "Cannot rebuild because the full-song spectrogram/MIDI cache is incomplete."
                 ) from exc
             print("Deleting incompatible local sliced cache and rebuilding the active format.")
