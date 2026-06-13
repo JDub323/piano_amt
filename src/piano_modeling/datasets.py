@@ -18,6 +18,7 @@ from .audio import AudioAugmenter, load_audio_segment
 from .common import DEVICE
 from .config import CFG, Config
 from .tokenization import PAD
+from .sliced_io import load_sliced_payload_from_row
 
 SPEC_LRU_CACHE_SIZE = 64
 
@@ -52,7 +53,7 @@ class PreSlicedMaestroDataset(Dataset):
         else:
             row_idx = idx % len(self.df)
         row = self.df.iloc[row_idx]
-        payload = torch.load(row["chunk_path"], map_location="cpu")
+        payload = load_sliced_payload_from_row(row)
         item = {"spec": payload["spec"].float()}
         if "tokens" in payload:
             item["tokens"] = payload["tokens"].long()

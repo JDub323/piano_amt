@@ -65,6 +65,10 @@ class Config:
     resume_sharded_sliced_backup: bool = True      # Reuse completed shard zips after Colab interruption.
     verify_sliced_zip_after_write: bool = False    # testzip() rereads every shard and is slow; atomic copies protect final files.
     verify_existing_preslice_shards: bool = False  # Avoid testzip() over Drive before restore; restore itself validates the zip.
+    compact_sliced_tensors_before_save: bool = True  # Clone crops so torch.save does not serialize full-song tensor storage.
+    delete_local_preslice_shard_after_backup: bool = True   # Free Colab disk after each build shard is safely on Drive.
+    delete_local_preslice_zip_after_copy: bool = True        # Do not keep a duplicate local shard zip after Drive copy.
+    use_zip_backed_sliced_dataset: bool = True               # Load chunks directly from Drive shard zips after local chunks are pruned.
 
     # Training
     FIND_OPTIMAL_SETTINGS: bool = False  # Legacy notebook flag; prefer the explicit flags below.

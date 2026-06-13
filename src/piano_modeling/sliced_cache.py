@@ -16,6 +16,7 @@ from .config import CFG, Config
 from .midi_labels import midi_to_targets
 from .tokenization import midi_to_event_tokens, token_vocab_size
 from .paths import ProjectPaths
+from .sliced_io import load_sliced_payload_from_row, row_has_zip_payload
 
 SPLITS = ("train", "validation", "test")
 
@@ -269,6 +270,71 @@ def start_sec_from_chunk_name(path: Path, cfg: Config) -> float:
     return 0.0
 
 
+def _split_from_zip_member(member: str) -> Optional[str]:
+    parts = Path(member).parts
+    for part in parts:
+        if part in SPLITS:
+            return part
+    return None
+
+
+def build_sliced_manifest_from_backup_sources(
+    paths: ProjectPaths,
+    cfg: Config = CFG,
+    backup_sources: Optional[Iterable[Path]] = None,
+) -> pd.DataFrame:
+    """Build a manifest whose rows point at chunk payloads inside backup zips.
+
+    This lets Colab delete completed local build shards after they are copied to
+    Drive. Training can still run by reading each chunk from the corresponding
+    shard zip. That is slower than local .pt files but avoids exhausting the
+    local runtime disk during dataset generation.
+    """
+    sources = [Path(p) for p in (backup_sources or active_sliced_backup_sources(paths, cfg))]
+    if not sources:
+        raise FileNotFoundError("No sliced-cache backup sources are available for a zip-backed manifest.")
+
+    rows: list[dict] = []
+    for zip_path in sources:
+        if not zip_path.exists():
+            continue
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in sorted(zf.namelist()):
+                if not member.endswith(".pt"):
+                    continue
+                split = _split_from_zip_member(member)
+                if split is None:
+                    continue
+                chunk_name = Path(member).name
+                rows.append({
+                    "chunk_path": str(Path(paths.sliced_root) / split / chunk_name),
+                    "split": split,
+                    "start_sec": start_sec_from_chunk_name(Path(chunk_name), cfg),
+                    "zip_path": str(zip_path),
+                    "zip_member": member,
+                })
+    if not rows:
+        raise FileNotFoundError("No sliced .pt chunk members were found in the provided shard zips.")
+    sliced_df = pd.DataFrame(rows)
+    sliced_df.to_csv(paths.sliced_manifest, index=False)
+    print(f"Built zip-backed sliced manifest with {len(sliced_df)} chunks: {paths.sliced_manifest}")
+    return sliced_df
+
+
+def compact_tensor_for_save(tensor: torch.Tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """Return a small standalone tensor suitable for torch.save.
+
+    Slicing a full-song spectrogram creates a view. If that view is saved
+    directly, torch.save may preserve the view's original storage, which can
+    serialize the entire full-song tensor once per chunk. This is the main cause
+    of runaway Colab disk usage during pre-slicing.
+    """
+    tensor = tensor.detach()
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype=dtype)
+    return tensor.contiguous().clone()
+
+
 def rebuild_sliced_manifest_from_files(paths: ProjectPaths, cfg: Config = CFG) -> pd.DataFrame:
     rows = []
     root = Path(paths.sliced_root)
@@ -305,6 +371,9 @@ def repair_manifest_paths(sliced_df: pd.DataFrame, paths: ProjectPaths, cfg: Con
         candidate = root / split / original.name
         if candidate.exists():
             repaired_paths.append(str(candidate))
+            continue
+        if row_has_zip_payload(row):
+            repaired_paths.append(str(original))
             continue
         if basename_index is None:
             basename_index = {}
@@ -370,15 +439,14 @@ def validate_sliced_cache_compatibility(sliced_df: pd.DataFrame, cfg: Config, sa
 
     chunks_without_metadata = 0
     for row in sample_rows:
-        path = Path(row["chunk_path"])
-        if not path.exists():
-            raise FileNotFoundError(f"Missing sliced chunk: {path}")
-        payload = torch.load(path, map_location="cpu")
+        path = Path(str(row["chunk_path"]))
+        payload = load_sliced_payload_from_row(row)
+        source_desc = str(path) if path.exists() else f"{row.get('zip_path')}::{row.get('zip_member')}"
         if not isinstance(payload, dict):
-            raise TypeError(f"Expected dict payload in {path}, got {type(payload)}")
+            raise TypeError(f"Expected dict payload in {source_desc}, got {type(payload)}")
         missing_keys = required - set(payload.keys())
         if missing_keys:
-            raise KeyError(f"{path} is missing required keys: {sorted(missing_keys)}")
+            raise KeyError(f"{source_desc} is missing required keys: {sorted(missing_keys)}")
 
         spec = payload["spec"]
         if spec.ndim != 2:
@@ -495,18 +563,22 @@ def _slice_song_rows_into_cache(
                     "training_data_format": label_format,
                     "token_velocity_bins": cfg.token_velocity_bins,
                 }
-                save_dict = {"spec": crop.to(dtype=torch.float16), "metadata": metadata}
+                if bool(getattr(cfg, "compact_sliced_tensors_before_save", True)):
+                    spec_to_save = compact_tensor_for_save(crop, dtype=torch.float16)
+                else:
+                    spec_to_save = crop.to(dtype=torch.float16)
+                save_dict = {"spec": spec_to_save, "metadata": metadata}
                 if label_format == "tokenwise":
                     tokens = midi_to_event_tokens(midi_path, start_sec, cfg.segment_seconds, cfg, max_seq_len=cfg.token_max_seq_len)
-                    save_dict["tokens"] = torch.from_numpy(tokens).to(torch.int32)
+                    save_dict["tokens"] = torch.from_numpy(tokens).to(torch.int32).contiguous()
                 else:
                     targets = midi_to_targets(midi_path, start_sec, cfg.segment_seconds, cfg, n_frames)
                     save_dict.update({
-                        "onset": torch.from_numpy(targets["onset"]).half(),
-                        "offset": torch.from_numpy(targets["offset"]).half(),
-                        "frame": torch.from_numpy(targets["frame"]).half(),
-                        "velocity": torch.from_numpy(targets["velocity"]).half(),
-                        "sustain": torch.from_numpy(targets["sustain"]).half(),
+                        "onset": torch.from_numpy(targets["onset"]).to(torch.float16).contiguous(),
+                        "offset": torch.from_numpy(targets["offset"]).to(torch.float16).contiguous(),
+                        "frame": torch.from_numpy(targets["frame"]).to(torch.float16).contiguous(),
+                        "velocity": torch.from_numpy(targets["velocity"]).to(torch.float16).contiguous(),
+                        "sustain": torch.from_numpy(targets["sustain"]).to(torch.float16).contiguous(),
                     })
                 chunk_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(save_dict, chunk_path)
@@ -545,6 +617,31 @@ def split_dataframe_song_shards(df: pd.DataFrame, cfg: Config) -> list[pd.DataFr
     return [df.iloc[start:start + songs_per_shard] for start in range(0, len(df), songs_per_shard)] or [df.iloc[0:0]]
 
 
+def delete_chunk_files_for_rows(shard_rows: list[dict], paths: ProjectPaths) -> None:
+    """Delete local .pt chunk files for a completed shard and prune empty dirs."""
+    deleted = 0
+    root = Path(paths.sliced_root)
+    touched_dirs: set[Path] = set()
+    for row in shard_rows:
+        chunk_path = Path(str(row.get("chunk_path", "")))
+        if chunk_path.exists() and chunk_path.is_file():
+            touched_dirs.add(chunk_path.parent)
+            chunk_path.unlink()
+            deleted += 1
+    for directory in sorted(touched_dirs, key=lambda p: len(p.parts), reverse=True):
+        current = directory
+        while current != root.parent and current.exists():
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            if current == root:
+                break
+            current = current.parent
+    if deleted:
+        print(f"Deleted {deleted} local chunk files for completed pre-slice shard to free Colab disk.")
+
+
 def backup_preslice_song_shard(
     shard_rows: list[dict],
     shard_index: int,
@@ -572,6 +669,10 @@ def backup_preslice_song_shard(
         raise RuntimeError(f"Local shard zip failed validation: {local_shard}")
     atomic_copy_to_drive(local_shard, target_shard)
     print(f"Saved pre-slice shard {shard_index + 1}/{num_shards} to Drive: {target_shard}")
+    if bool(getattr(cfg, "delete_local_preslice_zip_after_copy", True)) and local_shard.exists():
+        local_shard.unlink()
+    if bool(getattr(cfg, "delete_local_preslice_shard_after_backup", True)):
+        delete_chunk_files_for_rows(shard_rows, paths)
     return target_shard
 
 
@@ -622,6 +723,9 @@ def pre_slice_dataset_sharded_by_song(
             if bool(getattr(cfg, "verify_existing_preslice_shards", False)) and not zip_file_is_readable(target_shard):
                 should_restore = False
             if should_restore:
+                if bool(getattr(cfg, "use_zip_backed_sliced_dataset", True)):
+                    print(f"Pre-slice shard {shard_label} already exists on Drive; skipping without extracting: {target_shard.name}")
+                    continue
                 print(f"Pre-slice shard {shard_label} already exists on Drive; restoring/skipping: {target_shard.name}")
                 try:
                     restore_preslice_shard_into_local_cache(target_shard, paths)
@@ -643,8 +747,12 @@ def pre_slice_dataset_sharded_by_song(
         if backup_each:
             backup_preslice_song_shard(shard_rows, shard_index, num_shards, paths, cfg)
 
-    # Rebuild from the filesystem so restored/skipped shards are included too.
-    sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
+    # Rebuild the manifest. If completed shards were pruned locally, make a
+    # zip-backed manifest instead of extracting everything back to Colab disk.
+    if backup_each and bool(getattr(cfg, "use_zip_backed_sliced_dataset", True)):
+        sliced_df = build_sliced_manifest_from_backup_sources(paths, cfg, target_shards)
+    else:
+        sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
     if backup_each:
         complete = complete_sliced_preslice_shards(zip_path)
         if len(complete) != num_shards:
@@ -852,6 +960,13 @@ def load_or_build_sliced_dataset(
     if not has_sliced_files(paths.sliced_root):
         zip_path = active_sliced_zip_path(paths, cfg)
         if active_sliced_backup_exists(paths, cfg):
+            if bool(getattr(cfg, "use_zip_backed_sliced_dataset", True)):
+                sliced_df = build_sliced_manifest_from_backup_sources(paths, cfg)
+                sliced_df = repair_manifest_paths(sliced_df, paths, cfg)
+                validate_sliced_cache_compatibility(sliced_df, cfg)
+                print("Sliced chunk counts:")
+                print(sliced_df["split"].value_counts())
+                return sliced_df
             restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=False)
         elif allow_rebuild_if_sliced_zip_missing:
             print("Sliced backup is missing, but rebuild is explicitly allowed.")
@@ -861,8 +976,11 @@ def load_or_build_sliced_dataset(
                     "Rebuild it first, or restore the sliced zip."
                 )
             if partial_sliced_backup_exists(paths, cfg):
-                print("Found partial sliced-cache shards on Drive; restoring them before continuing the rebuild.")
-                restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=False, allow_partial_shards=True)
+                if bool(getattr(cfg, "use_zip_backed_sliced_dataset", True)):
+                    print("Found partial sliced-cache shards on Drive; leaving them zipped and continuing the rebuild.")
+                else:
+                    print("Found partial sliced-cache shards on Drive; restoring them before continuing the rebuild.")
+                    restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=False, allow_partial_shards=True)
             paths.sliced_root.mkdir(parents=True, exist_ok=True)
             sliced_df = pre_slice_dataset(meta_df, cfg, paths, max_songs=None)
             backup_sliced_dataset_to_drive(paths, cfg)
@@ -889,8 +1007,11 @@ def load_or_build_sliced_dataset(
         zip_path = active_sliced_zip_path(paths, cfg)
         if active_sliced_backup_exists(paths, cfg):
             print("Replacing local sliced cache with the active-format backup.")
-            restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=True)
-            sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
+            if bool(getattr(cfg, "use_zip_backed_sliced_dataset", True)):
+                sliced_df = build_sliced_manifest_from_backup_sources(paths, cfg)
+            else:
+                restore_sliced_dataset_from_zip(paths, cfg, force_resplice_sliced_cache=True)
+                sliced_df = rebuild_sliced_manifest_from_files(paths, cfg)
             sliced_df = repair_manifest_paths(sliced_df, paths, cfg)
             validate_sliced_cache_compatibility(sliced_df, cfg)
         elif allow_rebuild_if_sliced_zip_missing:
