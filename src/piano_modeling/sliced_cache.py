@@ -462,7 +462,8 @@ def _slice_song_rows_into_cache(
         try:
             payload = torch.load(spec_path, map_location="cpu")
             full_spec = payload["spec"] if isinstance(payload, dict) and "spec" in payload else payload
-            full_spec = full_spec.float()
+            if not torch.is_floating_point(full_spec):
+                full_spec = full_spec.float()
             duration = max(0.0, (full_spec.shape[-1] - 1) / cfg.fps)
             num_chunks = max(1, int(math.ceil(duration / cfg.segment_seconds)))
             for chunk_idx in range(num_chunks):
@@ -494,7 +495,7 @@ def _slice_song_rows_into_cache(
                     "training_data_format": label_format,
                     "token_velocity_bins": cfg.token_velocity_bins,
                 }
-                save_dict = {"spec": crop.half(), "metadata": metadata}
+                save_dict = {"spec": crop.to(dtype=torch.float16), "metadata": metadata}
                 if label_format == "tokenwise":
                     tokens = midi_to_event_tokens(midi_path, start_sec, cfg.segment_seconds, cfg, max_seq_len=cfg.token_max_seq_len)
                     save_dict["tokens"] = torch.from_numpy(tokens).to(torch.int32)
@@ -567,7 +568,7 @@ def backup_preslice_song_shard(
         target_shard.unlink()
     print(f"Backing up pre-slice shard {shard_index + 1}/{num_shards}: {len(files)} chunk files -> {target_shard.name}")
     write_zip_from_files(local_shard, Path(paths.sliced_root), files, cfg)
-    if not zip_file_is_readable(local_shard):
+    if bool(getattr(cfg, "verify_sliced_zip_after_write", False)) and not zip_file_is_readable(local_shard):
         raise RuntimeError(f"Local shard zip failed validation: {local_shard}")
     atomic_copy_to_drive(local_shard, target_shard)
     print(f"Saved pre-slice shard {shard_index + 1}/{num_shards} to Drive: {target_shard}")
@@ -617,11 +618,18 @@ def pre_slice_dataset_sharded_by_song(
         target_shard = target_shards[shard_index]
         shard_label = f"{shard_index + 1}/{num_shards}"
         if backup_each and target_shard.exists() and resume:
-            if zip_file_is_readable(target_shard):
+            should_restore = True
+            if bool(getattr(cfg, "verify_existing_preslice_shards", False)) and not zip_file_is_readable(target_shard):
+                should_restore = False
+            if should_restore:
                 print(f"Pre-slice shard {shard_label} already exists on Drive; restoring/skipping: {target_shard.name}")
-                restore_preslice_shard_into_local_cache(target_shard, paths)
-                continue
-            print(f"Pre-slice shard {shard_label} exists but is unreadable; deleting and rebuilding: {target_shard}")
+                try:
+                    restore_preslice_shard_into_local_cache(target_shard, paths)
+                    continue
+                except Exception as e:
+                    print(f"Could not restore pre-slice shard {shard_label}; deleting and rebuilding: {repr(e)}")
+            else:
+                print(f"Pre-slice shard {shard_label} exists but is unreadable; deleting and rebuilding: {target_shard}")
             target_shard.unlink()
 
         print(f"Pre-slicing song shard {shard_label} ({len(shard_df)} songs)...")
@@ -747,8 +755,10 @@ def backup_sliced_dataset_to_drive_sharded(paths: ProjectPaths, cfg: Config = CF
         total_mb = sum(p.stat().st_size for p in bucket) / (1024 * 1024)
         print(f"Creating shard {idx}/{num_shards}: {len(bucket)} files, {total_mb:.1f} MiB before compression")
         write_zip_from_files(local_shard, Path(paths.sliced_root), bucket, cfg)
+        if bool(getattr(cfg, "verify_sliced_zip_after_write", False)) and not zip_file_is_readable(local_shard):
+            raise RuntimeError(f"Local shard zip failed validation: {local_shard}")
         print(f"Copying shard {idx}/{num_shards} to Drive: {target_shard}")
-        shutil.copy(local_shard, target_shard)
+        atomic_copy_to_drive(local_shard, target_shard)
 
     complete = complete_sliced_zip_shards(zip_path)
     if len(complete) != num_shards:

@@ -126,9 +126,9 @@ def midi_to_event_tokens(
     max_seq_len = int(max_seq_len or cfg.token_max_seq_len)
     end_sec = float(start_sec) + float(segment_seconds)
     n_frames = cfg.label_frames
-    import pretty_midi
+    from .midi_labels import parse_midi_cached
 
-    pm = pretty_midi.PrettyMIDI(str(midi_path))
+    notes, sustain_cc, _ = parse_midi_cached(str(midi_path))
 
     events_by_frame: dict[int, list[tuple[int, int]]] = {}
 
@@ -136,28 +136,23 @@ def midi_to_event_tokens(
         frame = max(0, min(n_frames - 1, int(frame)))
         events_by_frame.setdefault(frame, []).append((priority, int(token)))
 
-    for inst in pm.instruments:
-        if inst.is_drum:
+    for note_start, note_end, pitch, velocity in notes:
+        if note_end < start_sec or note_start >= end_sec:
             continue
-        for note in inst.notes:
-            if note.end < start_sec or note.start >= end_sec:
-                continue
-            if not (cfg.midi_min <= note.pitch <= cfg.midi_max):
-                continue
-            pitch_idx = note.pitch - cfg.midi_min
-            on_frame = int(round((max(float(note.start), float(start_sec)) - start_sec) * cfg.fps))
-            off_frame = int(round((min(float(note.end), float(end_sec)) - start_sec) * cfg.fps))
-            vel_bin = velocity_to_bin(int(note.velocity), spec.velocity_bins)
-            add_event(on_frame, 1, note_on_token(pitch_idx, vel_bin, spec))
-            add_event(off_frame, 0, note_off_token(pitch_idx, spec))
+        if not (cfg.midi_min <= pitch <= cfg.midi_max):
+            continue
+        pitch_idx = pitch - cfg.midi_min
+        on_frame = int(round((max(float(note_start), float(start_sec)) - start_sec) * cfg.fps))
+        off_frame = int(round((min(float(note_end), float(end_sec)) - start_sec) * cfg.fps))
+        vel_bin = velocity_to_bin(int(velocity), spec.velocity_bins)
+        add_event(on_frame, 1, note_on_token(pitch_idx, vel_bin, spec))
+        add_event(off_frame, 0, note_off_token(pitch_idx, spec))
 
-        for cc in inst.control_changes:
-            if cc.number != 64:
-                continue
-            if cc.time < start_sec or cc.time >= end_sec:
-                continue
-            frame = int(round((float(cc.time) - start_sec) * cfg.fps))
-            add_event(frame, 2, PEDAL_ON if cc.value >= cfg.sustain_threshold else PEDAL_OFF)
+    for cc_time, cc_value in sustain_cc:
+        if cc_time < start_sec or cc_time >= end_sec:
+            continue
+        frame = int(round((float(cc_time) - start_sec) * cfg.fps))
+        add_event(frame, 2, PEDAL_ON if int(cc_value) >= cfg.sustain_threshold else PEDAL_OFF)
 
     tokens: List[int] = [BOS] if add_bos else []
     current_frame = 0

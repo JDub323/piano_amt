@@ -60,9 +60,11 @@ class Config:
     # pre-slice build shards above and still want a resumable post-build backup.
     use_sharded_sliced_backups: bool = True
     sliced_backup_num_shards: int = 4
-    sliced_backup_compression: str = "deflated"  # "deflated" or "stored"; stored is faster but larger.
-    sliced_backup_compresslevel: int = 1           # Low deflate level saves time on Colab.
+    sliced_backup_compression: str = "stored"    # "stored" is much faster on CPU; use "deflated" for smaller zips.
+    sliced_backup_compresslevel: int = 0           # Only used for deflated backups.
     resume_sharded_sliced_backup: bool = True      # Reuse completed shard zips after Colab interruption.
+    verify_sliced_zip_after_write: bool = False    # testzip() rereads every shard and is slow; atomic copies protect final files.
+    verify_existing_preslice_shards: bool = False  # Avoid testzip() over Drive before restore; restore itself validates the zip.
 
     # Training
     FIND_OPTIMAL_SETTINGS: bool = False  # Legacy notebook flag; prefer the explicit flags below.
