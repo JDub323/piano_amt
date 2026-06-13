@@ -48,6 +48,16 @@ class Config:
     delete_other_training_data_on_rebuild: bool = True
 
     # Sliced-cache backup/restore
+    # New default: pre-slice songs in small durable shards and copy each shard to Drive
+    # as soon as it finishes, so a dying Colab runtime does not lose all progress.
+    use_sharded_preslicing: bool = True
+    sliced_preslice_songs_per_shard: int = 80
+    resume_sharded_preslicing: bool = True
+    backup_preslice_shard_immediately: bool = True
+    skip_final_backup_when_preslice_shards_exist: bool = True
+
+    # Optional final backup sharding. This is mostly useful if you disable the
+    # pre-slice build shards above and still want a resumable post-build backup.
     use_sharded_sliced_backups: bool = True
     sliced_backup_num_shards: int = 4
     sliced_backup_compression: str = "deflated"  # "deflated" or "stored"; stored is faster but larger.
